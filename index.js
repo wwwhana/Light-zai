@@ -642,7 +642,7 @@ function clearPreset() {
 // 내부에서 {{input}}, {{workspace}}, {{model}}, {{date}} 치환
 function listSkills() {
   ensureDir(SKILLS_DIR);
-  return fs.readdirSync(SKILLS_DIR).filter(f => /\.(md|txt|js|py)$/.test(f)).map(f => f.replace(/\.(md|txt|js|py)$/, ''));
+  return fs.readdirSync(SKILLS_DIR).filter(f => /\.(md|txt|js|py)$/.test(f) && !f.includes('.example.')).map(f => f.replace(/\.(md|txt|js|py)$/, ''));
 }
 
 function loadSkill(name) {
@@ -840,7 +840,7 @@ async function executePySkill(name, meta, input) {
 function getScriptSkillTools() {
   const tools = [];
   ensureDir(SKILLS_DIR);
-  const files = fs.readdirSync(SKILLS_DIR).filter(f => f.endsWith('.js') || f.endsWith('.py'));
+  const files = fs.readdirSync(SKILLS_DIR).filter(f => (f.endsWith('.js') || f.endsWith('.py')) && !f.includes('.example.'));
   for (const f of files) {
     const ext = path.extname(f);
     const name = f.replace(/\.(js|py)$/, '');
