@@ -2013,19 +2013,8 @@ async function cmdMcp(arg) {
       config.servers = config.servers || {};
       config.servers[name] = { url: rest };
       saveMcpConfig(config);
-      console.log(`${c.green}MCP 서버 등록 (HTTP): ${name}${c.reset} → ${rest}`);
-
-      try {
-        const tools = await mcpConnect(name, config.servers[name]);
-        console.log(`  ${c.green}연결 성공${c.reset}: ${tools.length}개 도구`);
-        for (const t of tools) {
-          console.log(`    ${c.magenta}${t.name}${c.reset} ${c.dim}${(t.description || '').slice(0, 60)}${c.reset}`);
-        }
-      } catch (e) {
-        console.log(`  ${c.red}연결 실패${c.reset}: ${e.message}`);
-        console.log(`  ${c.dim}나중에 /mcp connect ${name} 으로 재시도${c.reset}`);
-      }
-      console.log('');
+      console.log(`${c.green}MCP 서버 등록 완료: ${name}${c.reset} → ${rest}`);
+      console.log(`  ${c.dim}연결하려면: /mcp connect ${name}${c.reset}\n`);
       break;
     }
     case 'stdio': {
@@ -2049,19 +2038,8 @@ async function cmdMcp(arg) {
       config.servers = config.servers || {};
       config.servers[name] = serverCfg;
       saveMcpConfig(config);
-      console.log(`${c.green}MCP 서버 등록 (stdio): ${name}${c.reset} → ${command} ${cmdArgs.join(' ')}`);
-
-      try {
-        const tools = await mcpConnect(name, config.servers[name]);
-        console.log(`  ${c.green}연결 성공${c.reset}: ${tools.length}개 도구`);
-        for (const t of tools) {
-          console.log(`    ${c.magenta}${t.name}${c.reset} ${c.dim}${(t.description || '').slice(0, 60)}${c.reset}`);
-        }
-      } catch (e) {
-        console.log(`  ${c.red}연결 실패${c.reset}: ${e.message}`);
-        console.log(`  ${c.dim}나중에 /mcp connect ${name} 으로 재시도${c.reset}`);
-      }
-      console.log('');
+      console.log(`${c.green}MCP 서버 등록 완료: ${name}${c.reset} → ${command} ${cmdArgs.join(' ')}`);
+      console.log(`  ${c.dim}연결하려면: /mcp connect ${name}${c.reset}\n`);
       break;
     }
     case 'remove': case 'rm': case 'delete': {
@@ -2321,8 +2299,8 @@ ${c.cyan}스킬${c.reset}  ${c.dim}(/<스킬이름> [인자]로 호출)${c.reset
 
 ${c.cyan}MCP 서버${c.reset}
   /mcp                        서버 목록
-  /mcp add <이름> <URL>       HTTP 서버 등록+연결
-  /mcp stdio <이름> <cmd...> [--env K=V ...]  stdio 서버 등록+연결
+  /mcp add <이름> <URL>       HTTP 서버 등록
+  /mcp stdio <이름> <cmd...> [--env K=V ...]  stdio 서버 등록
   /mcp remove <이름>          서버 제거
   /mcp connect <이름>         서버 연결
   /mcp disconnect <이름>      서버 연결 해제
