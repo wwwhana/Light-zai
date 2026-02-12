@@ -313,7 +313,7 @@ async function zaiChat(messages, options = {}) {
   // 도구 구성
   const tools = [];
   if (CFG.webSearch) tools.push({ type: 'web_search', web_search: { enable: true, search_engine: 'search-prime', search_result: true } });
-  if (CFG.tools) { tools.push(...FUNCTION_TOOLS); tools.push(...getMcpFunctionTools()); }
+  if (CFG.tools) { tools.push(...FUNCTION_TOOLS); tools.push(...getMcpFunctionTools()); tools.push(...getJsSkillTools()); }
   if (tools.length > 0) payload.tools = tools;
   if (options.tools) payload.tools = options.tools;
   if (options.stop) payload.stop = options.stop;
@@ -336,7 +336,7 @@ async function zaiChatStream(messages, callbacks, options = {}) {
 
   const tools = [];
   if (CFG.webSearch) tools.push({ type: 'web_search', web_search: { enable: true, search_engine: 'search-prime', search_result: true } });
-  if (CFG.tools) { tools.push(...FUNCTION_TOOLS); tools.push(...getMcpFunctionTools()); }
+  if (CFG.tools) { tools.push(...FUNCTION_TOOLS); tools.push(...getMcpFunctionTools()); tools.push(...getJsSkillTools()); }
   if (tools.length > 0) payload.tools = tools;
   if (options.tools) payload.tools = options.tools;
 
@@ -563,8 +563,13 @@ run_with_approval로 실행 가능한 명령:
   bash 명령도 가능 (예: ffmpeg, curl 등)
 
 파일을 읽을 때는 반드시 read_file 도구를 사용하세요. bash 명령어를 텍스트로 출력하지 마세요.
-사용자에게 부담이 되는 복잡한 명령은 run_with_approval로 대신 입력해주세요.
 최신 정보가 필요하면 web_search를 적극 활용하세요.
+
+중요 — 도구 사용 확인 규칙:
+- execute_command, write_file 을 바로 쓰지 말고, 먼저 사용자에게 실행할 명령/파일을 설명하고 확인을 받으세요.
+- 확인 없이 즉시 사용해도 되는 도구: read_file, web_search, web_read
+- 사용자가 명시적으로 "실행해", "해줘", "ㄱㄱ" 등으로 지시하면 바로 실행하세요.
+- 복잡하거나 위험한 작업은 run_with_approval을 사용하세요 (사용자에게 y/n 확인 프롬프트가 표시됩니다).
 `;
 
     // MCP 도구 설명 추가
@@ -572,6 +577,15 @@ run_with_approval로 실행 가능한 명령:
     if (mcpTools.length > 0) {
       prompt += `\nMCP 서버 도구:\n`;
       for (const t of mcpTools) {
+        prompt += `- ${t.function.name}: ${t.function.description || '(설명 없음)'}\n`;
+      }
+    }
+
+    // JS 스킬 도구 설명 추가
+    const jsSkillTools = getJsSkillTools();
+    if (jsSkillTools.length > 0) {
+      prompt += `\nJS 스킬 도구:\n`;
+      for (const t of jsSkillTools) {
         prompt += `- ${t.function.name}: ${t.function.description || '(설명 없음)'}\n`;
       }
     }
@@ -628,7 +642,7 @@ function clearPreset() {
 // 내부에서 {{input}}, {{workspace}}, {{model}}, {{date}} 치환
 function listSkills() {
   ensureDir(SKILLS_DIR);
-  return fs.readdirSync(SKILLS_DIR).filter(f => f.endsWith('.md') || f.endsWith('.txt')).map(f => f.replace(/\.(md|txt)$/, ''));
+  return fs.readdirSync(SKILLS_DIR).filter(f => /\.(md|txt|js)$/.test(f)).map(f => f.replace(/\.(md|txt|js)$/, ''));
 }
 
 function loadSkill(name) {
@@ -637,6 +651,46 @@ function loadSkill(name) {
   if (fs.existsSync(mdPath)) return fs.readFileSync(mdPath, 'utf-8');
   if (fs.existsSync(txtPath)) return fs.readFileSync(txtPath, 'utf-8');
   return null;
+}
+
+// JS 스킬 로드
+function loadJsSkill(name) {
+  const jsPath = path.join(SKILLS_DIR, `${name}.js`);
+  if (!fs.existsSync(jsPath)) return null;
+  try {
+    delete require.cache[require.resolve(jsPath)]; // 핫리로드
+    return require(jsPath);
+  } catch (e) {
+    console.error(`${c.red}JS 스킬 로드 오류 (${name}): ${e.message}${c.reset}`);
+    return null;
+  }
+}
+
+// JS 스킬용 HTTP 헬퍼 (내장 모듈만 사용)
+function skillHttp(method, url, body) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const mod = u.protocol === 'https:' ? https : http;
+    const payload = body ? JSON.stringify(body) : null;
+    const req = mod.request(u, {
+      method: method.toUpperCase(),
+      headers: {
+        ...(payload ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } : {}),
+      },
+      timeout: 30000,
+    }, (res) => {
+      let data = '';
+      res.on('data', (chunk) => data += chunk);
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, headers: res.headers, data: JSON.parse(data) }); }
+        catch { resolve({ status: res.statusCode, headers: res.headers, data }); }
+      });
+    });
+    req.on('error', (e) => reject(e));
+    req.on('timeout', () => { req.destroy(); reject(new Error('타임아웃')); });
+    if (payload) req.write(payload);
+    req.end();
+  });
 }
 
 function saveSkill(name, content) {
@@ -657,6 +711,10 @@ function expandSkillTemplate(template, input) {
 
 // 스킬 실행 — 프롬프트를 주입하고 AI에게 전송
 async function executeSkill(name, input) {
+  // JS 스킬 우선 확인
+  const jsMod = loadJsSkill(name);
+  if (jsMod) return await executeJsSkill(name, jsMod, input);
+
   const template = loadSkill(name);
   if (!template) return false;
 
@@ -675,6 +733,54 @@ async function executeSkill(name, input) {
     console.error(`${c.red}스킬 실행 오류: ${e.message}${c.reset}\n`);
   }
   return true;
+}
+
+// JS 스킬 실행
+async function executeJsSkill(name, mod, input) {
+  console.log(`${c.magenta}[JS 스킬]${c.reset} ${c.bold}${name}${c.reset}${input ? ` — ${c.dim}${input.slice(0, 60)}${c.reset}` : ''}`);
+  const ctx = { workspace: CFG.workspace, model: CFG.model, http: skillHttp, cwd: process.cwd() };
+  const fn = typeof mod === 'function' ? mod : mod.execute;
+  if (typeof fn !== 'function') {
+    console.error(`${c.red}JS 스킬에 execute 함수가 없습니다${c.reset}\n`);
+    return true;
+  }
+  try {
+    const result = await fn(input, ctx);
+    const text = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+    if (mod.prompt === false) {
+      // prompt: false 면 결과만 출력, AI에게 보내지 않음
+      console.log(text + '\n');
+    } else {
+      // AI에게 결과를 컨텍스트로 전송
+      const aiPrompt = mod.prompt
+        ? expandSkillTemplate(mod.prompt, input).replace(/\{\{result\}\}/g, text)
+        : `[${name} 스킬 결과]\n${text}\n\n위 결과를 바탕으로 답변해주세요.`;
+      const response = await sendMessage(aiPrompt);
+      if (response && !CFG.stream) console.log(`${c.green}AI>${c.reset} ${response}\n`);
+      else if (response) console.log('');
+    }
+  } catch (e) {
+    console.error(`${c.red}JS 스킬 오류: ${e.message}${c.reset}\n`);
+  }
+  return true;
+}
+
+// JS 스킬을 AI function calling 도구로 변환
+function getJsSkillTools() {
+  const tools = [];
+  ensureDir(SKILLS_DIR);
+  const jsFiles = fs.readdirSync(SKILLS_DIR).filter(f => f.endsWith('.js'));
+  for (const f of jsFiles) {
+    const name = f.replace(/\.js$/, '');
+    const mod = loadJsSkill(name);
+    if (!mod || !mod.parameters) continue;
+    tools.push({ type: 'function', function: {
+      name: `skill__${name}`,
+      description: mod.description || `${name} JS 스킬`,
+      parameters: { type: 'object', properties: mod.parameters, required: Object.keys(mod.parameters) },
+    }});
+  }
+  return tools;
 }
 
 // ===== MCP 클라이언트 (HTTP + stdio) =====
@@ -1123,33 +1229,18 @@ async function executeTool(toolName, args) {
       break;
     }
     case 'write_file': {
-      const fullPath = path.resolve(CFG.workspace, args.path);
-      console.log(`  ${c.dim}경로: ${fullPath} (${Buffer.byteLength(args.content)}B)${c.reset}`);
-      const wAnswer = await promptUser(`  파일을 쓸까요? (${c.green}y${c.reset}/${c.red}n${c.reset}) `);
-      if (wAnswer === 'y' || wAnswer === 'yes' || wAnswer === 'ㅛ') {
-        try {
-          const dir = path.dirname(fullPath);
-          if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-          fs.writeFileSync(fullPath, args.content, 'utf-8');
-          result = { success: true, path: fullPath, bytes: Buffer.byteLength(args.content) };
-        } catch (e) { result = { success: false, error: e.message }; }
-      } else {
-        console.log(`  ${c.dim}거부됨${c.reset}`);
-        result = { success: false, denied: true, message: '사용자가 파일 쓰기를 거부했습니다' };
-      }
+      try {
+        const fullPath = path.resolve(CFG.workspace, args.path);
+        const dir = path.dirname(fullPath);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(fullPath, args.content, 'utf-8');
+        result = { success: true, path: fullPath, bytes: Buffer.byteLength(args.content) };
+      } catch (e) { result = { success: false, error: e.message }; }
       break;
     }
-    case 'execute_command': {
-      console.log(`  ${c.cyan}${args.command}${c.reset}`);
-      const eAnswer = await promptUser(`  실행할까요? (${c.green}y${c.reset}/${c.red}n${c.reset}) `);
-      if (eAnswer === 'y' || eAnswer === 'yes' || eAnswer === 'ㅛ') {
-        result = await executeBashCommand(args.command);
-      } else {
-        console.log(`  ${c.dim}거부됨${c.reset}`);
-        result = { success: false, denied: true, message: '사용자가 실행을 거부했습니다' };
-      }
+    case 'execute_command':
+      result = await executeBashCommand(args.command);
       break;
-    }
     case 'web_search': {
       try {
         const sr = await duckDuckGoSearch(args.query);
@@ -1191,13 +1282,31 @@ async function executeTool(toolName, args) {
       break;
     }
     default: {
+      // JS 스킬 도구 처리 (skill__스킬명)
+      const skillMatch = toolName.match(/^skill__(.+)$/);
+      if (skillMatch) {
+        const skillName = skillMatch[1];
+        const mod = loadJsSkill(skillName);
+        if (mod && (typeof mod === 'function' || typeof mod.execute === 'function')) {
+          const ctx = { workspace: CFG.workspace, model: CFG.model, http: skillHttp, cwd: process.cwd() };
+          const fn = typeof mod === 'function' ? mod : mod.execute;
+          try {
+            const res = await fn(args, ctx);
+            result = { success: true, output: typeof res === 'string' ? res : JSON.stringify(res) };
+          } catch (e) {
+            result = { success: false, error: e.message };
+          }
+        } else {
+          result = { success: false, error: `JS 스킬 없음: ${skillName}` };
+        }
+        break;
+      }
       // MCP 도구 처리 (mcp__서버명__도구명)
       const mcpMatch = toolName.match(/^mcp__([^_]+)__(.+)$/);
       if (mcpMatch) {
         const [, serverName, mcpToolName] = mcpMatch;
         try {
           const mcpResult = await mcpCallTool(serverName, mcpToolName, args);
-          // MCP 결과를 텍스트로 변환
           const content = mcpResult.content || [];
           const text = content.map(c => c.type === 'text' ? c.text : JSON.stringify(c)).join('\n');
           result = { success: !mcpResult.isError, output: text || JSON.stringify(mcpResult) };
