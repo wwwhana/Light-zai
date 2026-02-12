@@ -2,7 +2,6 @@
   "apiKey": "",
   "model": "glm-5",
   "baseUrl": "api.z.ai",
-  "chatPath": "/api/coding/paas/v4/chat/completions",
   "apiPrefix": "/api/paas/v4",
   "stream": true,
   "think": false,

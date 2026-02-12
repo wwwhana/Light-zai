@@ -68,8 +68,7 @@ npm run start:full     # 디버그 + Tool Calling
 | `ZAI_API_KEY` | *(필수)* | API 키 |
 | `LZAI_MODEL` | `glm-5` | 사용할 모델 |
 | `LZAI_BASE_URL` | `api.z.ai` | API 서버 호스트 |
-| `LZAI_CHAT_PATH` | `/api/coding/paas/v4/chat/completions` | 채팅 API 경로 |
-| `LZAI_API_PREFIX` | `/api/paas/v4` | API prefix 경로 |
+| `LZAI_API_PREFIX` | `/api/paas/v4` | API prefix (채팅: `{prefix}/chat/completions`) |
 | `LZAI_WORKSPACE` | 현재 디렉토리 | 파일/명령 작업 디렉토리 |
 | `LZAI_TOOLS` | `0` | `1`로 설정 시 Tool Calling 활성화 |
 | `LZAI_STREAM` | `1` | `0`으로 설정 시 스트리밍 비활성화 |
@@ -87,7 +86,6 @@ npm run start:full     # 디버그 + Tool Calling
 {
   "model": "glm-5",
   "baseUrl": "api.z.ai",
-  "chatPath": "/api/coding/paas/v4/chat/completions",
   "apiPrefix": "/api/paas/v4",
   "stream": true,
   "think": false,

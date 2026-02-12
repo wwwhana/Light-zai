@@ -60,7 +60,6 @@ function ensureDir(dir) {
 const DEFAULT_CONFIG = {
   model: 'glm-5',
   baseUrl: 'api.z.ai',
-  chatPath: '/api/coding/paas/v4/chat/completions',
   apiPrefix: '/api/paas/v4',
   stream: true,
   think: false,
@@ -91,7 +90,6 @@ const savedCfg = loadConfig();
 const CFG = {
   apiKey:     process.env.ZAI_API_KEY       || savedCfg.apiKey     || '',
   baseUrl:    process.env.LZAI_BASE_URL    || savedCfg.baseUrl    || DEFAULT_CONFIG.baseUrl,
-  chatPath:   process.env.LZAI_CHAT_PATH   || savedCfg.chatPath   || DEFAULT_CONFIG.chatPath,
   apiPrefix:  process.env.LZAI_API_PREFIX  || savedCfg.apiPrefix  || DEFAULT_CONFIG.apiPrefix,
   model:      process.env.LZAI_MODEL       || savedCfg.model      || DEFAULT_CONFIG.model,
   debug:      process.env.LZAI_DEBUG === '1',
@@ -320,7 +318,7 @@ async function zaiChat(messages, options = {}) {
   if (options.tools) payload.tools = options.tools;
   if (options.stop) payload.stop = options.stop;
 
-  const res = await apiPost(CFG.chatPath, payload);
+  const res = await apiPost(CFG.apiPrefix + '/chat/completions', payload);
   if (res.usage) lastUsage = res.usage;
   return res;
 }
@@ -342,7 +340,7 @@ async function zaiChatStream(messages, callbacks, options = {}) {
   if (tools.length > 0) payload.tools = tools;
   if (options.tools) payload.tools = options.tools;
 
-  return apiPostStream(CFG.chatPath, payload, callbacks);
+  return apiPostStream(CFG.apiPrefix + '/chat/completions', payload, callbacks);
 }
 
 // ===== API: 웹 검색 =====
@@ -1751,7 +1749,6 @@ function printConfig() {
   console.log(`  ${c.cyan}maxTokens${c.reset}   = ${CFG.maxTokens}`);
   console.log(`  ${c.cyan}temperature${c.reset} = ${CFG.temperature}`);
   console.log(`  ${c.cyan}baseUrl${c.reset}     = ${CFG.baseUrl}`);
-  console.log(`  ${c.cyan}chatPath${c.reset}    = ${CFG.chatPath}`);
   console.log(`  ${c.cyan}apiPrefix${c.reset}   = ${CFG.apiPrefix}`);
   console.log(`  ${c.cyan}workspace${c.reset}   = ${CFG.workspace}`);
   console.log(`  ${c.cyan}apiKey${c.reset}      = ${CFG.apiKey ? '***' + CFG.apiKey.slice(-4) : '(없음)'}`);
@@ -1767,7 +1764,7 @@ function cmdSetConfig(arg) {
   if (key === 'save') {
     const cfg = { model: CFG.model, stream: CFG.stream, think: CFG.think, tools: CFG.tools,
       webSearch: CFG.webSearch, maxTokens: CFG.maxTokens, temperature: CFG.temperature,
-      baseUrl: CFG.baseUrl, chatPath: CFG.chatPath, apiPrefix: CFG.apiPrefix };
+      baseUrl: CFG.baseUrl, apiPrefix: CFG.apiPrefix };
     if (CFG.apiKey) cfg.apiKey = CFG.apiKey;
     saveConfig(cfg);
     console.log(`${c.green}설정 저장 완료${c.reset}: ${CONFIG_FILE}\n`);
@@ -1778,7 +1775,7 @@ function cmdSetConfig(arg) {
 
   const boolKeys = ['stream', 'think', 'tools', 'webSearch', 'jsonMode', 'debug'];
   const numKeys = ['maxTokens', 'temperature'];
-  const strKeys = ['model', 'baseUrl', 'chatPath', 'apiPrefix', 'apiKey', 'workspace'];
+  const strKeys = ['model', 'baseUrl', 'apiPrefix', 'apiKey', 'workspace'];
 
   if (boolKeys.includes(key)) {
     CFG[key] = val === 'true' || val === '1' || val === 'on';
@@ -1862,7 +1859,7 @@ async function cmdDoctor() {
 
     try {
       const start = Date.now();
-      const res = await apiPost(CFG.chatPath, {
+      const res = await apiPost(CFG.apiPrefix + '/chat/completions', {
         model: CFG.model, messages: [{ role: 'user', content: '1+1=' }], max_tokens: 5,
       });
       const ms = Date.now() - start;
