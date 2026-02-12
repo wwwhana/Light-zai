@@ -57,11 +57,27 @@ function ensureDir(dir) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
+const DEFAULT_CONFIG = {
+  model: 'glm-5',
+  baseUrl: 'api.z.ai',
+  chatPath: '/api/coding/paas/v4/chat/completions',
+  apiPrefix: '/api/paas/v4',
+  stream: true,
+  think: false,
+  tools: false,
+  webSearch: false,
+  maxTokens: 4096,
+  temperature: 0.7,
+};
+
 function loadConfig() {
   try {
     if (fs.existsSync(CONFIG_FILE)) return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
   } catch (_) { /* 무시 */ }
-  return {};
+  // 초기 설정 파일 생성
+  ensureDir(CONFIG_DIR);
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(DEFAULT_CONFIG, null, 2), 'utf-8');
+  return { ...DEFAULT_CONFIG };
 }
 
 function saveConfig(cfg) {
@@ -74,18 +90,18 @@ const savedCfg = loadConfig();
 
 const CFG = {
   apiKey:     process.env.ZAI_API_KEY       || savedCfg.apiKey     || '',
-  baseUrl:    process.env.LZAI_BASE_URL    || savedCfg.baseUrl    || 'api.z.ai',
-  chatPath:   process.env.LZAI_CHAT_PATH   || savedCfg.chatPath   || '/api/coding/paas/v4/chat/completions',
-  apiPrefix:  process.env.LZAI_API_PREFIX  || savedCfg.apiPrefix  || '/api/paas/v4',
-  model:      process.env.LZAI_MODEL       || savedCfg.model      || 'glm-5',
+  baseUrl:    process.env.LZAI_BASE_URL    || savedCfg.baseUrl    || DEFAULT_CONFIG.baseUrl,
+  chatPath:   process.env.LZAI_CHAT_PATH   || savedCfg.chatPath   || DEFAULT_CONFIG.chatPath,
+  apiPrefix:  process.env.LZAI_API_PREFIX  || savedCfg.apiPrefix  || DEFAULT_CONFIG.apiPrefix,
+  model:      process.env.LZAI_MODEL       || savedCfg.model      || DEFAULT_CONFIG.model,
   debug:      process.env.LZAI_DEBUG === '1',
   workspace:  process.env.LZAI_WORKSPACE   || process.cwd(),
-  tools:      process.env.LZAI_TOOLS  !== undefined ? process.env.LZAI_TOOLS  === '1' : (savedCfg.tools  ?? false),
-  stream:     process.env.LZAI_STREAM !== undefined ? process.env.LZAI_STREAM !== '0' : (savedCfg.stream ?? true),
-  think:      process.env.LZAI_THINK  !== undefined ? process.env.LZAI_THINK  === '1' : (savedCfg.think  ?? false),
-  webSearch:  process.env.LZAI_WEB_SEARCH !== undefined ? process.env.LZAI_WEB_SEARCH === '1' : (savedCfg.webSearch ?? false),
-  maxTokens:  parseInt(process.env.LZAI_MAX_TOKENS   || savedCfg.maxTokens  || '4096'),
-  temperature:parseFloat(process.env.LZAI_TEMPERATURE || savedCfg.temperature || '0.7'),
+  tools:      process.env.LZAI_TOOLS  !== undefined ? process.env.LZAI_TOOLS  === '1' : (savedCfg.tools  ?? DEFAULT_CONFIG.tools),
+  stream:     process.env.LZAI_STREAM !== undefined ? process.env.LZAI_STREAM !== '0' : (savedCfg.stream ?? DEFAULT_CONFIG.stream),
+  think:      process.env.LZAI_THINK  !== undefined ? process.env.LZAI_THINK  === '1' : (savedCfg.think  ?? DEFAULT_CONFIG.think),
+  webSearch:  process.env.LZAI_WEB_SEARCH !== undefined ? process.env.LZAI_WEB_SEARCH === '1' : (savedCfg.webSearch ?? DEFAULT_CONFIG.webSearch),
+  maxTokens:  parseInt(process.env.LZAI_MAX_TOKENS   || savedCfg.maxTokens  || DEFAULT_CONFIG.maxTokens),
+  temperature:parseFloat(process.env.LZAI_TEMPERATURE || savedCfg.temperature || DEFAULT_CONFIG.temperature),
   jsonMode:   false,
 };
 
