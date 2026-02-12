@@ -1,26 +1,24 @@
 {
   "name": "light-zai",
-  "version": "3.0.0",
-  "description": "z.ai 올인원 코딩 챗봇 CLI - GLM-5 모델 기반 AI 어시스턴트",
+  "version": "4.0.0",
+  "description": "z.ai 올인원 코딩 챗봇 CLI - 경량 AI 어시스턴트 (ARM7L/x86_64/aarch64, 무의존성)",
   "main": "index.js",
   "bin": {
-    "light-zai": "./index.js"
+    "light-zai": "./index.js",
+    "lz": "./index.js"
   },
   "scripts": {
     "start": "node index.js",
     "start:tools": "ENABLE_TOOLS=1 node index.js",
-    "start:debug": "DEBUG=1 node index.js",
-    "start:full": "DEBUG=1 ENABLE_TOOLS=1 node index.js"
+    "start:full": "ENABLE_TOOLS=1 ENABLE_THINK=1 node index.js",
+    "start:debug": "DEBUG=1 ENABLE_TOOLS=1 node index.js",
+    "doctor": "node index.js --doctor"
   },
   "keywords": [
-    "zai",
-    "z.ai",
-    "glm-5",
-    "chatbot",
-    "cli",
-    "ai",
-    "coding-assistant",
-    "tool-calling"
+    "zai", "z.ai", "glm-5", "glm-4.7", "chatbot", "cli",
+    "ai", "coding-assistant", "tool-calling", "arm7l",
+    "streaming", "web-search", "image-generation", "video-generation",
+    "ocr", "embeddings", "speech-recognition", "zero-dependency"
   ],
   "license": "MIT",
   "engines": {
