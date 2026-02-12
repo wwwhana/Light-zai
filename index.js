@@ -73,19 +73,19 @@ function saveConfig(cfg) {
 const savedCfg = loadConfig();
 
 const CFG = {
-  apiKey:     process.env.ZAI_API_KEY     || savedCfg.apiKey     || '',
-  baseUrl:    process.env.ZAI_BASE_URL    || savedCfg.baseUrl    || 'api.z.ai',
-  chatPath:   process.env.ZAI_CHAT_PATH   || savedCfg.chatPath   || '/api/coding/paas/v4/chat/completions',
-  apiPrefix:  process.env.ZAI_API_PREFIX  || savedCfg.apiPrefix  || '/api/paas/v4',
-  model:      process.env.MODEL           || savedCfg.model      || 'glm-5',
-  debug:      process.env.DEBUG === '1',
-  workspace:  process.env.WORKSPACE       || process.cwd(),
-  tools:      process.env.ENABLE_TOOLS  !== undefined ? process.env.ENABLE_TOOLS  === '1' : (savedCfg.tools  ?? false),
-  stream:     process.env.ENABLE_STREAM !== undefined ? process.env.ENABLE_STREAM !== '0' : (savedCfg.stream ?? true),
-  think:      process.env.ENABLE_THINK  !== undefined ? process.env.ENABLE_THINK  === '1' : (savedCfg.think  ?? false),
-  webSearch:  process.env.ENABLE_WEB_SEARCH !== undefined ? process.env.ENABLE_WEB_SEARCH === '1' : (savedCfg.webSearch ?? false),
-  maxTokens:  parseInt(process.env.MAX_TOKENS   || savedCfg.maxTokens  || '4096'),
-  temperature:parseFloat(process.env.TEMPERATURE || savedCfg.temperature || '0.7'),
+  apiKey:     process.env.ZAI_API_KEY       || savedCfg.apiKey     || '',
+  baseUrl:    process.env.LZAI_BASE_URL    || savedCfg.baseUrl    || 'api.z.ai',
+  chatPath:   process.env.LZAI_CHAT_PATH   || savedCfg.chatPath   || '/api/coding/paas/v4/chat/completions',
+  apiPrefix:  process.env.LZAI_API_PREFIX  || savedCfg.apiPrefix  || '/api/paas/v4',
+  model:      process.env.LZAI_MODEL       || savedCfg.model      || 'glm-5',
+  debug:      process.env.LZAI_DEBUG === '1',
+  workspace:  process.env.LZAI_WORKSPACE   || process.cwd(),
+  tools:      process.env.LZAI_TOOLS  !== undefined ? process.env.LZAI_TOOLS  === '1' : (savedCfg.tools  ?? false),
+  stream:     process.env.LZAI_STREAM !== undefined ? process.env.LZAI_STREAM !== '0' : (savedCfg.stream ?? true),
+  think:      process.env.LZAI_THINK  !== undefined ? process.env.LZAI_THINK  === '1' : (savedCfg.think  ?? false),
+  webSearch:  process.env.LZAI_WEB_SEARCH !== undefined ? process.env.LZAI_WEB_SEARCH === '1' : (savedCfg.webSearch ?? false),
+  maxTokens:  parseInt(process.env.LZAI_MAX_TOKENS   || savedCfg.maxTokens  || '4096'),
+  temperature:parseFloat(process.env.LZAI_TEMPERATURE || savedCfg.temperature || '0.7'),
   jsonMode:   false,
 };
 
