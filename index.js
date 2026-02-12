@@ -21,6 +21,7 @@ const CONFIG_DIR = path.join(os.homedir(), '.config', 'light-zai');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 const SESSIONS_DIR = path.join(CONFIG_DIR, 'sessions');
 const PRESETS_DIR = path.join(CONFIG_DIR, 'presets');
+const SKILLS_DIR = path.join(CONFIG_DIR, 'skills');
 const MCP_CONFIG_FILE = path.join(CONFIG_DIR, 'mcp.json');
 
 // ===== ANSI 색상 =====
@@ -605,6 +606,61 @@ function clearPreset() {
   if (conversationHistory.length > 0 && conversationHistory[0].role === 'system') {
     conversationHistory[0].content = buildSystemPrompt();
   }
+}
+
+// ===== 스킬 시스템 =====
+// 스킬 = 슬래시 명령으로 호출하는 프롬프트 템플릿
+// ~/.config/light-zai/skills/<name>.md 파일
+// 내부에서 {{input}}, {{workspace}}, {{model}}, {{date}} 치환
+function listSkills() {
+  ensureDir(SKILLS_DIR);
+  return fs.readdirSync(SKILLS_DIR).filter(f => f.endsWith('.md') || f.endsWith('.txt')).map(f => f.replace(/\.(md|txt)$/, ''));
+}
+
+function loadSkill(name) {
+  const mdPath = path.join(SKILLS_DIR, `${name}.md`);
+  const txtPath = path.join(SKILLS_DIR, `${name}.txt`);
+  if (fs.existsSync(mdPath)) return fs.readFileSync(mdPath, 'utf-8');
+  if (fs.existsSync(txtPath)) return fs.readFileSync(txtPath, 'utf-8');
+  return null;
+}
+
+function saveSkill(name, content) {
+  ensureDir(SKILLS_DIR);
+  fs.writeFileSync(path.join(SKILLS_DIR, `${name}.md`), content, 'utf-8');
+}
+
+function expandSkillTemplate(template, input) {
+  const now = new Date();
+  return template
+    .replace(/\{\{input\}\}/g, input || '')
+    .replace(/\{\{workspace\}\}/g, CFG.workspace)
+    .replace(/\{\{model\}\}/g, CFG.model)
+    .replace(/\{\{date\}\}/g, now.toLocaleDateString('ko-KR'))
+    .replace(/\{\{time\}\}/g, now.toLocaleTimeString('ko-KR', { hour:'2-digit', minute:'2-digit', hour12: false }))
+    .replace(/\{\{cwd\}\}/g, process.cwd());
+}
+
+// 스킬 실행 — 프롬프트를 주입하고 AI에게 전송
+async function executeSkill(name, input) {
+  const template = loadSkill(name);
+  if (!template) return false;
+
+  const prompt = expandSkillTemplate(template, input);
+  console.log(`${c.magenta}[스킬]${c.reset} ${c.bold}${name}${c.reset}${input ? ` — ${c.dim}${input.slice(0, 60)}${c.reset}` : ''}\n`);
+
+  // 프롬프트를 사용자 메시지로 전송
+  try {
+    const response = await sendMessage(prompt);
+    if (response && !CFG.stream) {
+      console.log(`${c.green}AI>${c.reset} ${response}\n`);
+    } else if (response) {
+      console.log('');
+    }
+  } catch (e) {
+    console.error(`${c.red}스킬 실행 오류: ${e.message}${c.reset}\n`);
+  }
+  return true;
 }
 
 // ===== MCP 클라이언트 (HTTP + stdio) =====
@@ -1413,9 +1469,20 @@ async function handleSlashCommand(input, rl) {
       await cmdMcp(arg);
       break;
 
-    default:
-      console.log(`${c.red}알 수 없는 명령어: /${cmd}${c.reset}`);
-      console.log(`  /help 로 명령어 목록 확인\n`);
+    case 'skill':
+      await cmdSkill(arg);
+      break;
+
+    default: {
+      // 스킬로 시도
+      const executed = await executeSkill(cmd, arg);
+      if (!executed) {
+        console.log(`${c.red}알 수 없는 명령어: /${cmd}${c.reset}`);
+        const skills = listSkills();
+        if (skills.length) console.log(`  ${c.dim}등록된 스킬: ${skills.join(', ')}${c.reset}`);
+        console.log(`  /help 로 명령어 목록 확인\n`);
+      }
+    }
   }
 }
 
@@ -2026,6 +2093,157 @@ async function cmdMcp(arg) {
   }
 }
 
+// ===== 스킬 명령어 =====
+async function cmdSkill(arg) {
+  const parts = arg ? arg.split(/\s+/) : [];
+  const sub = parts[0] || '';
+  const name = parts[1] || '';
+
+  switch (sub) {
+    case '':
+    case 'list': {
+      const skills = listSkills();
+      if (!skills.length) {
+        console.log(`${c.dim}등록된 스킬이 없습니다${c.reset}`);
+        console.log(`  ${c.dim}/skill init 으로 기본 스킬 생성${c.reset}`);
+        console.log(`  ${c.dim}/skill new <이름> 으로 직접 생성${c.reset}`);
+        console.log(`  ${c.dim}또는 ${SKILLS_DIR}/ 에 .md 파일 추가${c.reset}\n`);
+        return;
+      }
+      console.log(`\n${c.bold}스킬 목록:${c.reset}  ${c.dim}(사용: /<스킬이름> [인자])${c.reset}\n`);
+      for (const s of skills) {
+        const content = loadSkill(s) || '';
+        // 첫 줄이 # 제목이면 사용, 아니면 첫 줄 미리보기
+        const firstLine = content.split('\n').find(l => l.trim()) || '';
+        const desc = firstLine.startsWith('#') ? firstLine.replace(/^#+\s*/, '') : firstLine.slice(0, 60);
+        console.log(`  ${c.cyan}/${s.padEnd(18)}${c.reset} ${c.dim}${desc}${c.reset}`);
+      }
+      console.log(`\n  /skill show <이름>    내용 보기`);
+      console.log(`  /skill new <이름>     새 스킬 생성`);
+      console.log(`  /skill delete <이름>  삭제\n`);
+      break;
+    }
+    case 'show': case 'cat': {
+      if (!name) { console.log(`${c.yellow}사용법: /skill show <이름>${c.reset}\n`); return; }
+      const content = loadSkill(name);
+      if (!content) { console.log(`${c.red}스킬 없음: ${name}${c.reset}\n`); return; }
+      console.log(`\n${c.bold}스킬: ${name}${c.reset}`);
+      console.log(`${c.dim}파일: ${path.join(SKILLS_DIR, name + '.md')}${c.reset}\n`);
+      console.log(content);
+      console.log('');
+      break;
+    }
+    case 'new': case 'create': case 'add': {
+      if (!name) { console.log(`${c.yellow}사용법: /skill new <이름>${c.reset}\n`); return; }
+      if (loadSkill(name)) { console.log(`${c.yellow}이미 존재: ${name}${c.reset} (/skill show ${name} 으로 확인)\n`); return; }
+      console.log(`${c.cyan}스킬 내용을 입력하세요 (빈 줄로 종료):${c.reset}`);
+      console.log(`${c.dim}  사용 가능한 변수: {{input}} {{workspace}} {{model}} {{date}} {{time}} {{cwd}}${c.reset}`);
+      const lines = [];
+      const collectLine = () => new Promise(resolve => {
+        if (_rl) _rl.question('  ', answer => resolve(answer));
+        else resolve(null);
+      });
+      while (true) {
+        const line = await collectLine();
+        if (line === null || line === '') break;
+        lines.push(line);
+      }
+      if (!lines.length) { console.log(`${c.dim}취소됨${c.reset}\n`); return; }
+      saveSkill(name, lines.join('\n'));
+      console.log(`${c.green}스킬 생성: /${name}${c.reset}`);
+      console.log(`  ${c.dim}${path.join(SKILLS_DIR, name + '.md')}${c.reset}\n`);
+      break;
+    }
+    case 'edit': {
+      if (!name) { console.log(`${c.yellow}사용법: /skill edit <이름>${c.reset}\n`); return; }
+      const existing = loadSkill(name);
+      if (!existing) { console.log(`${c.red}스킬 없음: ${name}${c.reset}\n`); return; }
+      console.log(`${c.cyan}현재 내용:${c.reset}\n${c.dim}${existing}${c.reset}\n`);
+      console.log(`${c.cyan}새 내용을 입력하세요 (빈 줄로 종료):${c.reset}`);
+      const lines = [];
+      const collectLine = () => new Promise(resolve => {
+        if (_rl) _rl.question('  ', answer => resolve(answer));
+        else resolve(null);
+      });
+      while (true) {
+        const line = await collectLine();
+        if (line === null || line === '') break;
+        lines.push(line);
+      }
+      if (!lines.length) { console.log(`${c.dim}취소됨${c.reset}\n`); return; }
+      saveSkill(name, lines.join('\n'));
+      console.log(`${c.green}스킬 수정됨: /${name}${c.reset}\n`);
+      break;
+    }
+    case 'delete': case 'rm': {
+      if (!name) { console.log(`${c.yellow}사용법: /skill delete <이름>${c.reset}\n`); return; }
+      const mdPath = path.join(SKILLS_DIR, `${name}.md`);
+      const txtPath = path.join(SKILLS_DIR, `${name}.txt`);
+      if (fs.existsSync(mdPath)) fs.unlinkSync(mdPath);
+      else if (fs.existsSync(txtPath)) fs.unlinkSync(txtPath);
+      else { console.log(`${c.red}스킬 없음: ${name}${c.reset}\n`); return; }
+      console.log(`${c.green}스킬 삭제: ${name}${c.reset}\n`);
+      break;
+    }
+    case 'init': {
+      // 기본 스킬 세트 생성
+      const defaults = {
+        'review': `# 코드 리뷰
+다음 코드 또는 파일을 리뷰해주세요. 버그, 보안 취약점, 성능 문제, 가독성을 검토하세요.
+
+{{input}}`,
+        'refactor': `# 리팩토링
+다음 코드를 리팩토링해주세요. 가독성, 유지보수성, 성능을 개선하되 동작은 변경하지 마세요.
+
+{{input}}`,
+        'explain': `# 코드 설명
+다음 코드를 단계별로 상세히 설명해주세요. 초보자도 이해할 수 있게 설명하세요.
+
+{{input}}`,
+        'test': `# 테스트 작성
+다음 코드에 대한 테스트 코드를 작성해주세요. 엣지 케이스도 포함하세요.
+
+{{input}}`,
+        'commit': `# 커밋 메시지 생성
+현재 작업 디렉토리({{workspace}})의 git diff를 분석하고 적절한 커밋 메시지를 작성해주세요.
+Conventional Commits 형식을 사용하세요.
+
+{{input}}`,
+        'translate': `# 번역
+다음 텍스트를 번역해주세요. 원문의 뉘앙스와 맥락을 살려서 자연스럽게 번역하세요.
+
+{{input}}`,
+        'fix': `# 버그 수정
+다음 코드의 버그를 찾아서 수정해주세요. 원인 분석과 수정된 코드를 모두 제공하세요.
+
+{{input}}`,
+        'doc': `# 문서화
+다음 코드에 대한 문서(주석, docstring, README 등)를 작성해주세요.
+
+{{input}}`,
+      };
+      ensureDir(SKILLS_DIR);
+      let created = 0;
+      for (const [sname, content] of Object.entries(defaults)) {
+        if (!loadSkill(sname)) {
+          saveSkill(sname, content);
+          created++;
+        }
+      }
+      console.log(`${c.green}기본 스킬 ${created}개 생성됨${c.reset}`);
+      const skills = listSkills();
+      for (const s of skills) {
+        console.log(`  ${c.cyan}/${s}${c.reset}`);
+      }
+      console.log(`\n  ${c.dim}사용 예: /review 이 함수의 문제점을 찾아줘${c.reset}`);
+      console.log(`  ${c.dim}수정: /skill edit <이름> 또는 직접 ${SKILLS_DIR}/ 편집${c.reset}\n`);
+      break;
+    }
+    default:
+      console.log(`  사용법: /skill [list|show|new|edit|delete|init]\n`);
+  }
+}
+
 function printHelp() {
   console.log(`
 ${c.bold}=== Light-zai v${VERSION} 명령어 ===${c.reset}
@@ -2068,6 +2286,14 @@ ${c.cyan}프리셋${c.reset}
   /preset show    활성 프리셋 보기
   /preset off     프리셋 해제
   /preset delete <이름> 프리셋 삭제
+
+${c.cyan}스킬${c.reset}  ${c.dim}(/<스킬이름> [인자]로 호출)${c.reset}
+  /skill          스킬 목록
+  /skill init     기본 스킬 세트 생성
+  /skill new <이름>     스킬 생성
+  /skill show <이름>    스킬 내용 보기
+  /skill edit <이름>    스킬 편집
+  /skill delete <이름>  스킬 삭제
 
 ${c.cyan}MCP 서버${c.reset}
   /mcp                        서버 목록
