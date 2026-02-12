@@ -313,7 +313,7 @@ async function zaiChat(messages, options = {}) {
   // 도구 구성
   const tools = [];
   if (CFG.webSearch) tools.push({ type: 'web_search', web_search: { enable: true, search_engine: 'search-prime', search_result: true } });
-  if (CFG.tools) { tools.push(...FUNCTION_TOOLS); tools.push(...getMcpFunctionTools()); tools.push(...getJsSkillTools()); }
+  if (CFG.tools) { tools.push(...FUNCTION_TOOLS); tools.push(...getMcpFunctionTools()); tools.push(...getScriptSkillTools()); }
   if (tools.length > 0) payload.tools = tools;
   if (options.tools) payload.tools = options.tools;
   if (options.stop) payload.stop = options.stop;
@@ -336,7 +336,7 @@ async function zaiChatStream(messages, callbacks, options = {}) {
 
   const tools = [];
   if (CFG.webSearch) tools.push({ type: 'web_search', web_search: { enable: true, search_engine: 'search-prime', search_result: true } });
-  if (CFG.tools) { tools.push(...FUNCTION_TOOLS); tools.push(...getMcpFunctionTools()); tools.push(...getJsSkillTools()); }
+  if (CFG.tools) { tools.push(...FUNCTION_TOOLS); tools.push(...getMcpFunctionTools()); tools.push(...getScriptSkillTools()); }
   if (tools.length > 0) payload.tools = tools;
   if (options.tools) payload.tools = options.tools;
 
@@ -582,7 +582,7 @@ run_with_approval로 실행 가능한 명령:
     }
 
     // JS 스킬 도구 설명 추가
-    const jsSkillTools = getJsSkillTools();
+    const jsSkillTools = getScriptSkillTools();
     if (jsSkillTools.length > 0) {
       prompt += `\nJS 스킬 도구:\n`;
       for (const t of jsSkillTools) {
@@ -642,7 +642,7 @@ function clearPreset() {
 // 내부에서 {{input}}, {{workspace}}, {{model}}, {{date}} 치환
 function listSkills() {
   ensureDir(SKILLS_DIR);
-  return fs.readdirSync(SKILLS_DIR).filter(f => /\.(md|txt|js)$/.test(f)).map(f => f.replace(/\.(md|txt|js)$/, ''));
+  return fs.readdirSync(SKILLS_DIR).filter(f => /\.(md|txt|js|py)$/.test(f)).map(f => f.replace(/\.(md|txt|js|py)$/, ''));
 }
 
 function loadSkill(name) {
@@ -715,6 +715,10 @@ async function executeSkill(name, input) {
   const jsMod = loadJsSkill(name);
   if (jsMod) return await executeJsSkill(name, jsMod, input);
 
+  // Python 스킬 확인
+  const pyMeta = loadPySkillMeta(name);
+  if (pyMeta) return await executePySkill(name, pyMeta, input);
+
   const template = loadSkill(name);
   if (!template) return false;
 
@@ -765,20 +769,98 @@ async function executeJsSkill(name, mod, input) {
   return true;
 }
 
-// JS 스킬을 AI function calling 도구로 변환
-function getJsSkillTools() {
+// Python 스킬 메타데이터 파싱 (파일 상단 # key: value 주석)
+function loadPySkillMeta(name) {
+  const pyPath = path.join(SKILLS_DIR, `${name}.py`);
+  if (!fs.existsSync(pyPath)) return null;
+  const src = fs.readFileSync(pyPath, 'utf-8');
+  const meta = { path: pyPath };
+  for (const line of src.split('\n')) {
+    const m = line.match(/^#\s*(description|parameters|prompt):\s*(.+)/);
+    if (m) {
+      const [, key, val] = m;
+      if (key === 'parameters') { try { meta.parameters = JSON.parse(val); } catch {} }
+      else if (key === 'prompt' && val.trim() === 'false') meta.prompt = false;
+      else meta[key] = val.trim();
+    }
+    if (!line.startsWith('#') && line.trim() !== '') break; // 주석 블록 끝
+  }
+  return meta;
+}
+
+// Python 스킬 실행 (spawn, stdin→JSON, stdout→결과)
+function runPySkill(pyPath, input) {
+  return new Promise((resolve, reject) => {
+    const py = process.platform === 'win32' ? 'python' : 'python3';
+    const child = spawn(py, [pyPath], {
+      cwd: CFG.workspace,
+      env: { ...process.env, WORKSPACE: CFG.workspace },
+      timeout: 30000,
+    });
+    let stdout = '', stderr = '';
+    child.stdout.on('data', (d) => stdout += d);
+    child.stderr.on('data', (d) => stderr += d);
+    child.on('error', (e) => reject(new Error(`python 실행 실패: ${e.message}`)));
+    child.on('close', (code) => {
+      if (code !== 0) reject(new Error(stderr.trim() || `종료 코드: ${code}`));
+      else {
+        try { resolve(JSON.parse(stdout)); }
+        catch { resolve(stdout.trim()); }
+      }
+    });
+    const payload = JSON.stringify(typeof input === 'string' ? { input } : input);
+    child.stdin.write(payload);
+    child.stdin.end();
+  });
+}
+
+// Python 스킬 실행 + AI 전달
+async function executePySkill(name, meta, input) {
+  console.log(`${c.magenta}[PY 스킬]${c.reset} ${c.bold}${name}${c.reset}${input ? ` — ${c.dim}${(typeof input === 'string' ? input : JSON.stringify(input)).slice(0, 60)}${c.reset}` : ''}`);
+  try {
+    const result = await runPySkill(meta.path, input);
+    const text = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+    if (meta.prompt === false) {
+      console.log(text + '\n');
+    } else {
+      const aiPrompt = meta.prompt
+        ? expandSkillTemplate(meta.prompt, typeof input === 'string' ? input : '').replace(/\{\{result\}\}/g, text)
+        : `[${name} 스킬 결과]\n${text}\n\n위 결과를 바탕으로 답변해주세요.`;
+      const response = await sendMessage(aiPrompt);
+      if (response && !CFG.stream) console.log(`${c.green}AI>${c.reset} ${response}\n`);
+      else if (response) console.log('');
+    }
+  } catch (e) {
+    console.error(`${c.red}PY 스킬 오류: ${e.message}${c.reset}\n`);
+  }
+  return true;
+}
+
+// JS + Python 스킬을 AI function calling 도구로 변환
+function getScriptSkillTools() {
   const tools = [];
   ensureDir(SKILLS_DIR);
-  const jsFiles = fs.readdirSync(SKILLS_DIR).filter(f => f.endsWith('.js'));
-  for (const f of jsFiles) {
-    const name = f.replace(/\.js$/, '');
-    const mod = loadJsSkill(name);
-    if (!mod || !mod.parameters) continue;
-    tools.push({ type: 'function', function: {
-      name: `skill__${name}`,
-      description: mod.description || `${name} JS 스킬`,
-      parameters: { type: 'object', properties: mod.parameters, required: Object.keys(mod.parameters) },
-    }});
+  const files = fs.readdirSync(SKILLS_DIR).filter(f => f.endsWith('.js') || f.endsWith('.py'));
+  for (const f of files) {
+    const ext = path.extname(f);
+    const name = f.replace(/\.(js|py)$/, '');
+    if (ext === '.js') {
+      const mod = loadJsSkill(name);
+      if (!mod || !mod.parameters) continue;
+      tools.push({ type: 'function', function: {
+        name: `skill__${name}`,
+        description: mod.description || `${name} JS 스킬`,
+        parameters: { type: 'object', properties: mod.parameters, required: Object.keys(mod.parameters) },
+      }});
+    } else {
+      const meta = loadPySkillMeta(name);
+      if (!meta || !meta.parameters) continue;
+      tools.push({ type: 'function', function: {
+        name: `skill__${name}`,
+        description: meta.description || `${name} Python 스킬`,
+        parameters: { type: 'object', properties: meta.parameters, required: Object.keys(meta.parameters) },
+      }});
+    }
   }
   return tools;
 }
@@ -1282,10 +1364,11 @@ async function executeTool(toolName, args) {
       break;
     }
     default: {
-      // JS 스킬 도구 처리 (skill__스킬명)
+      // 스크립트 스킬 도구 처리 (skill__스킬명)
       const skillMatch = toolName.match(/^skill__(.+)$/);
       if (skillMatch) {
         const skillName = skillMatch[1];
+        // JS 스킬 시도
         const mod = loadJsSkill(skillName);
         if (mod && (typeof mod === 'function' || typeof mod.execute === 'function')) {
           const ctx = { workspace: CFG.workspace, model: CFG.model, http: skillHttp, cwd: process.cwd() };
@@ -1293,12 +1376,19 @@ async function executeTool(toolName, args) {
           try {
             const res = await fn(args, ctx);
             result = { success: true, output: typeof res === 'string' ? res : JSON.stringify(res) };
-          } catch (e) {
-            result = { success: false, error: e.message };
-          }
-        } else {
-          result = { success: false, error: `JS 스킬 없음: ${skillName}` };
+          } catch (e) { result = { success: false, error: e.message }; }
+          break;
         }
+        // Python 스킬 시도
+        const pyMeta = loadPySkillMeta(skillName);
+        if (pyMeta) {
+          try {
+            const res = await runPySkill(pyMeta.path, args);
+            result = { success: true, output: typeof res === 'string' ? res : JSON.stringify(res) };
+          } catch (e) { result = { success: false, error: e.message }; }
+          break;
+        }
+        result = { success: false, error: `스킬 없음: ${skillName}` };
         break;
       }
       // MCP 도구 처리 (mcp__서버명__도구명)
