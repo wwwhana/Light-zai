@@ -6,7 +6,7 @@ const http = require('http');
 const readline = require('readline');
 const fs = require('fs');
 const path = require('path');
-const { exec } = require('child_process');
+const { exec, spawn } = require('child_process');
 const util = require('util');
 const os = require('os');
 
@@ -607,7 +607,7 @@ function clearPreset() {
   }
 }
 
-// ===== MCP 클라이언트 (HTTP only) =====
+// ===== MCP 클라이언트 (HTTP + stdio) =====
 function loadMcpConfig() {
   try {
     if (fs.existsSync(MCP_CONFIG_FILE)) return JSON.parse(fs.readFileSync(MCP_CONFIG_FILE, 'utf-8'));
@@ -620,7 +620,15 @@ function saveMcpConfig(config) {
   fs.writeFileSync(MCP_CONFIG_FILE, JSON.stringify(config, null, 2), 'utf-8');
 }
 
-function mcpRequest(serverUrl, method, params = {}, headers = {}) {
+// 서버 설정에서 트랜스포트 타입 판별
+function mcpTransportType(serverCfg) {
+  if (serverCfg.command) return 'stdio';
+  if (serverCfg.url) return 'http';
+  return 'unknown';
+}
+
+// --- HTTP 트랜스포트 ---
+function mcpHttpRequest(serverUrl, method, params = {}, headers = {}) {
   return new Promise((resolve, reject) => {
     const url = new URL(serverUrl);
     const mod = url.protocol === 'https:' ? https : http;
@@ -645,7 +653,6 @@ function mcpRequest(serverUrl, method, params = {}, headers = {}) {
         try {
           const contentType = res.headers['content-type'] || '';
           if (contentType.includes('text/event-stream')) {
-            // SSE 응답 파싱
             const lines = data.split('\n');
             for (const line of lines) {
               if (line.startsWith('data:')) {
@@ -672,52 +679,178 @@ function mcpRequest(serverUrl, method, params = {}, headers = {}) {
   });
 }
 
-async function mcpConnect(name, url) {
-  debugLog(`MCP 연결: ${name} → ${url}`);
-  const headers = {};
+// --- stdio 트랜스포트 ---
+function mcpSpawnProcess(command, args = [], env = {}) {
+  const mergedEnv = { ...process.env, ...env };
+  const child = spawn(command, args, {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: mergedEnv,
+  });
+  let buffer = '';
+  const pending = new Map(); // id → { resolve, reject }
+  let _nextId = 1;
 
-  // 초기화
-  const initRes = await mcpRequest(url, 'initialize', {
-    protocolVersion: '2025-03-26',
-    capabilities: {},
-    clientInfo: { name: APP_NAME, version: VERSION },
-  }, headers);
+  child.stdout.on('data', (chunk) => {
+    buffer += chunk.toString();
+    // JSON-RPC 메시지를 줄 단위로 파싱
+    let newlineIdx;
+    while ((newlineIdx = buffer.indexOf('\n')) !== -1) {
+      const line = buffer.slice(0, newlineIdx).trim();
+      buffer = buffer.slice(newlineIdx + 1);
+      if (!line) continue;
+      try {
+        const msg = JSON.parse(line);
+        if (msg.id !== undefined && pending.has(msg.id)) {
+          const { resolve } = pending.get(msg.id);
+          pending.delete(msg.id);
+          resolve(msg);
+        }
+        // 알림(notification)은 id가 없으므로 무시
+      } catch (_) {
+        debugLog('MCP stdio 파싱 실패:', line.slice(0, 100));
+      }
+    }
+  });
 
-  if (initRes.error) throw new Error(`MCP 초기화 실패: ${initRes.error.message}`);
+  child.stderr.on('data', (chunk) => {
+    debugLog('MCP stderr:', chunk.toString().trim());
+  });
 
-  const sessionId = initRes._meta?.sessionId || null;
-  if (sessionId) headers['Mcp-Session-Id'] = sessionId;
+  child.on('error', (err) => {
+    // 모든 대기중 요청 reject
+    for (const [id, { reject }] of pending) {
+      reject(new Error(`MCP 프로세스 오류: ${err.message}`));
+      pending.delete(id);
+    }
+  });
 
-  // initialized 알림
-  await mcpRequest(url, 'notifications/initialized', {}, headers).catch(() => {});
+  child.on('close', (code) => {
+    for (const [id, { reject }] of pending) {
+      reject(new Error(`MCP 프로세스 종료 (code: ${code})`));
+      pending.delete(id);
+    }
+  });
 
-  // 도구 목록 조회
-  const toolsRes = await mcpRequest(url, 'tools/list', {}, headers);
-  const tools = toolsRes.result?.tools || [];
+  function send(method, params = {}) {
+    return new Promise((resolve, reject) => {
+      const id = _nextId++;
+      const msg = JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n';
+      pending.set(id, { resolve, reject });
+      child.stdin.write(msg, (err) => {
+        if (err) {
+          pending.delete(id);
+          reject(new Error(`MCP stdin 쓰기 실패: ${err.message}`));
+        }
+      });
+      // 30초 타임아웃
+      setTimeout(() => {
+        if (pending.has(id)) {
+          pending.delete(id);
+          reject(new Error('MCP stdio 타임아웃'));
+        }
+      }, 30000);
+    });
+  }
 
-  mcpServers[name] = { url, tools, sessionId, headers };
-  debugLog(`MCP ${name}: ${tools.length}개 도구 발견`);
-  return tools;
+  function notify(method, params = {}) {
+    const msg = JSON.stringify({ jsonrpc: '2.0', method, params }) + '\n';
+    child.stdin.write(msg);
+  }
+
+  function kill() {
+    child.kill();
+  }
+
+  return { send, notify, kill, process: child };
+}
+
+// --- 통합 연결 ---
+async function mcpConnect(name, serverCfg) {
+  const transport = mcpTransportType(serverCfg);
+  debugLog(`MCP 연결: ${name} (${transport})`);
+
+  if (transport === 'http') {
+    const url = serverCfg.url;
+    const headers = {};
+
+    const initRes = await mcpHttpRequest(url, 'initialize', {
+      protocolVersion: '2025-03-26',
+      capabilities: {},
+      clientInfo: { name: APP_NAME, version: VERSION },
+    }, headers);
+
+    if (initRes.error) throw new Error(`MCP 초기화 실패: ${initRes.error.message}`);
+
+    const sessionId = initRes._meta?.sessionId || null;
+    if (sessionId) headers['Mcp-Session-Id'] = sessionId;
+
+    await mcpHttpRequest(url, 'notifications/initialized', {}, headers).catch(() => {});
+
+    const toolsRes = await mcpHttpRequest(url, 'tools/list', {}, headers);
+    const tools = toolsRes.result?.tools || [];
+
+    mcpServers[name] = { transport: 'http', url, tools, sessionId, headers };
+    debugLog(`MCP ${name}: ${tools.length}개 도구 발견`);
+    return tools;
+
+  } else if (transport === 'stdio') {
+    const stdio = mcpSpawnProcess(serverCfg.command, serverCfg.args || [], serverCfg.env || {});
+
+    const initRes = await stdio.send('initialize', {
+      protocolVersion: '2025-03-26',
+      capabilities: {},
+      clientInfo: { name: APP_NAME, version: VERSION },
+    });
+
+    if (initRes.error) {
+      stdio.kill();
+      throw new Error(`MCP 초기화 실패: ${initRes.error.message}`);
+    }
+
+    stdio.notify('notifications/initialized');
+
+    const toolsRes = await stdio.send('tools/list');
+    const tools = toolsRes.result?.tools || [];
+
+    mcpServers[name] = { transport: 'stdio', stdio, tools, command: serverCfg.command };
+    debugLog(`MCP ${name}: ${tools.length}개 도구 발견`);
+    return tools;
+
+  } else {
+    throw new Error(`알 수 없는 MCP 트랜스포트: command 또는 url을 지정하세요`);
+  }
 }
 
 async function mcpDisconnect(name) {
-  if (mcpServers[name]) {
-    delete mcpServers[name];
-    debugLog(`MCP 연결 해제: ${name}`);
+  const server = mcpServers[name];
+  if (!server) return;
+  if (server.transport === 'stdio' && server.stdio) {
+    server.stdio.kill();
   }
+  delete mcpServers[name];
+  debugLog(`MCP 연결 해제: ${name}`);
 }
 
 async function mcpCallTool(serverName, toolName, args) {
   const server = mcpServers[serverName];
   if (!server) throw new Error(`MCP 서버 없음: ${serverName}`);
 
-  const res = await mcpRequest(server.url, 'tools/call', {
-    name: toolName,
-    arguments: args,
-  }, server.headers || {});
+  if (server.transport === 'http') {
+    const res = await mcpHttpRequest(server.url, 'tools/call', {
+      name: toolName,
+      arguments: args,
+    }, server.headers || {});
+    if (res.error) throw new Error(`MCP 도구 오류: ${res.error.message}`);
+    return res.result;
 
-  if (res.error) throw new Error(`MCP 도구 오류: ${res.error.message}`);
-  return res.result;
+  } else if (server.transport === 'stdio') {
+    const res = await server.stdio.send('tools/call', {
+      name: toolName,
+      arguments: args,
+    });
+    if (res.error) throw new Error(`MCP 도구 오류: ${res.error.message}`);
+    return res.result;
+  }
 }
 
 // MCP 도구를 OpenAI function calling 형식으로 변환
@@ -744,7 +877,7 @@ async function mcpAutoConnect() {
   const servers = config.servers || {};
   for (const [name, cfg] of Object.entries(servers)) {
     try {
-      const tools = await mcpConnect(name, cfg.url);
+      const tools = await mcpConnect(name, cfg);
       console.log(`  ${c.green}MCP${c.reset} ${name}: ${tools.length}개 도구 연결됨`);
     } catch (e) {
       console.log(`  ${c.red}MCP${c.reset} ${name}: 연결 실패 - ${e.message}`);
@@ -1758,49 +1891,77 @@ async function cmdMcp(arg) {
   const parts = arg ? arg.split(/\s+/) : [];
   const sub = parts[0] || '';
   const name = parts[1] || '';
-  const url = parts[2] || '';
+  const rest = parts.slice(2).join(' ').trim();
 
   switch (sub) {
     case '':
     case 'list': {
       const config = loadMcpConfig();
       const configServers = Object.keys(config.servers || {});
-      const connectedServers = Object.keys(mcpServers);
 
-      if (!configServers.length && !connectedServers.length) {
+      if (!configServers.length) {
         console.log(`${c.dim}등록된 MCP 서버가 없습니다${c.reset}`);
-        console.log(`  ${c.dim}추가: /mcp add <이름> <URL>${c.reset}\n`);
+        console.log(`  ${c.dim}HTTP:  /mcp add <이름> <URL>${c.reset}`);
+        console.log(`  ${c.dim}stdio: /mcp stdio <이름> <명령> [인자...]${c.reset}\n`);
         return;
       }
 
       console.log(`\n${c.bold}MCP 서버:${c.reset}\n`);
       for (const sname of configServers) {
+        const cfg = config.servers[sname];
         const connected = mcpServers[sname];
-        const surl = config.servers[sname].url;
         const toolCount = connected ? connected.tools.length : 0;
         const status = connected ? `${c.green}연결됨${c.reset} (${toolCount}개 도구)` : `${c.dim}연결 안됨${c.reset}`;
-        console.log(`  ${c.cyan}${sname.padEnd(15)}${c.reset} ${status}`);
-        console.log(`  ${c.dim}${' '.repeat(15)} ${surl}${c.reset}`);
+        const transport = mcpTransportType(cfg);
+        const target = transport === 'stdio' ? `${cfg.command} ${(cfg.args || []).join(' ')}` : cfg.url;
+        console.log(`  ${c.cyan}${sname.padEnd(15)}${c.reset} [${transport}] ${status}`);
+        console.log(`  ${c.dim}${' '.repeat(15)} ${target}${c.reset}`);
         if (connected) {
           for (const t of connected.tools) {
             console.log(`  ${' '.repeat(15)} ${c.magenta}${t.name}${c.reset} ${c.dim}${(t.description || '').slice(0, 50)}${c.reset}`);
           }
         }
       }
-      console.log(`\n  사용법: /mcp add <이름> <URL> | /mcp remove <이름> | /mcp connect <이름>\n`);
+      console.log(`\n  /mcp add <이름> <URL>              HTTP 서버 등록`);
+      console.log(`  /mcp stdio <이름> <명령> [인자...]  stdio 서버 등록`);
+      console.log(`  /mcp remove|connect|disconnect|tools\n`);
       break;
     }
     case 'add': {
-      if (!name || !url) { console.log(`${c.yellow}사용법: /mcp add <이름> <URL>${c.reset}\n`); return; }
+      if (!name || !rest) { console.log(`${c.yellow}사용법: /mcp add <이름> <URL>${c.reset}\n`); return; }
       const config = loadMcpConfig();
       config.servers = config.servers || {};
-      config.servers[name] = { url };
+      config.servers[name] = { url: rest };
       saveMcpConfig(config);
-      console.log(`${c.green}MCP 서버 등록: ${name}${c.reset} → ${url}`);
+      console.log(`${c.green}MCP 서버 등록 (HTTP): ${name}${c.reset} → ${rest}`);
 
-      // 자동 연결 시도
       try {
-        const tools = await mcpConnect(name, url);
+        const tools = await mcpConnect(name, config.servers[name]);
+        console.log(`  ${c.green}연결 성공${c.reset}: ${tools.length}개 도구`);
+        for (const t of tools) {
+          console.log(`    ${c.magenta}${t.name}${c.reset} ${c.dim}${(t.description || '').slice(0, 60)}${c.reset}`);
+        }
+      } catch (e) {
+        console.log(`  ${c.red}연결 실패${c.reset}: ${e.message}`);
+        console.log(`  ${c.dim}나중에 /mcp connect ${name} 으로 재시도${c.reset}`);
+      }
+      console.log('');
+      break;
+    }
+    case 'stdio': {
+      // /mcp stdio <이름> <명령> [인자...]
+      if (!name || !rest) { console.log(`${c.yellow}사용법: /mcp stdio <이름> <명령> [인자...]${c.reset}\n`); return; }
+      const stdioParts = rest.split(/\s+/);
+      const command = stdioParts[0];
+      const cmdArgs = stdioParts.slice(1);
+      const config = loadMcpConfig();
+      config.servers = config.servers || {};
+      config.servers[name] = { command, args: cmdArgs };
+      saveMcpConfig(config);
+      console.log(`${c.green}MCP 서버 등록 (stdio): ${name}${c.reset} → ${command} ${cmdArgs.join(' ')}`);
+
+      try {
+        const tools = await mcpConnect(name, config.servers[name]);
         console.log(`  ${c.green}연결 성공${c.reset}: ${tools.length}개 도구`);
         for (const t of tools) {
           console.log(`    ${c.magenta}${t.name}${c.reset} ${c.dim}${(t.description || '').slice(0, 60)}${c.reset}`);
@@ -1830,7 +1991,7 @@ async function cmdMcp(arg) {
       if (!serverCfg) { console.log(`${c.red}등록되지 않은 서버: ${name}${c.reset}\n`); return; }
       try {
         process.stdout.write(`${c.dim}MCP 연결중...${c.reset}`);
-        const tools = await mcpConnect(name, serverCfg.url);
+        const tools = await mcpConnect(name, serverCfg);
         process.stdout.write('\r\x1b[K');
         console.log(`${c.green}MCP 연결: ${name}${c.reset} (${tools.length}개 도구)`);
         for (const t of tools) {
@@ -1861,7 +2022,7 @@ async function cmdMcp(arg) {
       break;
     }
     default:
-      console.log(`  사용법: /mcp [list|add|remove|connect|disconnect|tools]\n`);
+      console.log(`  사용법: /mcp [list|add|stdio|remove|connect|disconnect|tools]\n`);
   }
 }
 
@@ -1909,12 +2070,13 @@ ${c.cyan}프리셋${c.reset}
   /preset delete <이름> 프리셋 삭제
 
 ${c.cyan}MCP 서버${c.reset}
-  /mcp            MCP 서버 목록
-  /mcp add <이름> <URL>  서버 등록+연결
-  /mcp remove <이름>     서버 제거
-  /mcp connect <이름>    서버 연결
-  /mcp disconnect <이름> 서버 연결 해제
-  /mcp tools      연결된 MCP 도구 목록
+  /mcp                        서버 목록
+  /mcp add <이름> <URL>       HTTP 서버 등록+연결
+  /mcp stdio <이름> <cmd...>  stdio 서버 등록+연결
+  /mcp remove <이름>          서버 제거
+  /mcp connect <이름>         서버 연결
+  /mcp disconnect <이름>      서버 연결 해제
+  /mcp tools                  연결된 MCP 도구 목록
 
 ${c.cyan}기타${c.reset}
   /doctor         시스템 진단
