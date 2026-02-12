@@ -1,7 +1,7 @@
 {
   "name": "light-zai",
   "version": "4.0.0",
-  "description": "z.ai 올인원 코딩 챗봇 CLI - 경량 AI 어시스턴트 (ARM7L/x86_64/aarch64, 무의존성)",
+  "description": "올인원 코딩 챗봇 CLI - 경량 AI 어시스턴트 (ARM7L/x86_64/aarch64, 무의존성)",
   "main": "index.js",
   "bin": {
     "light-zai": "./index.js",
@@ -15,7 +15,7 @@
     "doctor": "node index.js --doctor"
   },
   "keywords": [
-    "zai", "z.ai", "glm-5", "glm-4.7", "chatbot", "cli",
+    "chatbot", "cli",
     "ai", "coding-assistant", "tool-calling", "arm7l",
     "streaming", "web-search", "image-generation", "video-generation",
     "ocr", "embeddings", "speech-recognition", "zero-dependency"

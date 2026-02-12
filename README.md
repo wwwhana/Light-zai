@@ -1,6 +1,6 @@
 # Light-zai
 
-**ARM7L에서도 돌아가는 가벼운 z.ai 코딩 챗봇**
+**ARM7L에서도 돌아가는 가벼운 AI 코딩 챗봇**
 
 외부 의존성 없이 Node.js 내장 모듈만으로 동작하는 올인원 CLI 챗봇입니다.
 Raspberry Pi 등 ARM7L 저사양 기기에서도 원활하게 실행됩니다.
@@ -11,7 +11,7 @@ Raspberry Pi 등 ARM7L 저사양 기기에서도 원활하게 실행됩니다.
 - **ARM7L 호환** — Raspberry Pi, Orange Pi 등 저사양 ARM 기기 지원
 - **듀얼 모드** — AI 채팅 모드와 Bash 셸 모드를 `!` 하나로 전환
 - **Tool Calling** — 파일 읽기/쓰기, 셸 명령 실행, 웹 검색 지원
-- **z.ai API (GLM-5)** — 한국어에 최적화된 AI 모델 사용
+- **OpenAI 호환 API** — 다양한 AI 모델 연동 가능
 - **대화 컨텍스트 유지** — 멀티턴 대화, Bash 결과도 AI가 기억
 
 ## 빠른 시작
@@ -55,8 +55,8 @@ npm run start:full     # 디버그 + Tool Calling
 
 | 변수 | 기본값 | 설명 |
 |---|---|---|
-| `ZAI_API_KEY` | *(필수)* | z.ai API 키 |
-| `MODEL` | `glm-5` | 사용할 모델 |
+| `ZAI_API_KEY` | *(필수)* | API 키 |
+| `MODEL` | *(기본 모델)* | 사용할 모델 |
 | `WORKSPACE` | 현재 디렉토리 | 파일/명령 작업 디렉토리 |
 | `ENABLE_TOOLS` | `0` | `1`로 설정 시 Tool Calling 활성화 |
 | `DEBUG` | `0` | `1`로 설정 시 디버그 로깅 |
@@ -123,7 +123,7 @@ bash:/home/user$ exit
 - **Node.js** 14.0.0 이상
 - **아키텍처**: ARM7L, x86_64, aarch64 등 Node.js가 지원하는 모든 플랫폼
 - **메모리**: 최소 ~20MB (Node.js 런타임 포함)
-- **네트워크**: z.ai API 접속 필요 (`api.z.ai:443`)
+- **네트워크**: API 서버 접속 필요
 - **외부 의존성**: 없음
 
 ### ARM7L 기기 (Raspberry Pi 등)

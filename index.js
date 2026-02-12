@@ -280,7 +280,7 @@ function apiPostStream(apiPath, body, callbacks) {
   return httpStream(opts, jsonBody, callbacks);
 }
 
-// ===== z.ai API: 챗 완성 =====
+// ===== API: 챗 완성 =====
 async function zaiChat(messages, options = {}) {
   const payload = {
     model: options.model || CFG.model,
@@ -324,7 +324,7 @@ async function zaiChatStream(messages, callbacks, options = {}) {
   return apiPostStream(CFG.chatPath, payload, callbacks);
 }
 
-// ===== z.ai API: 웹 검색 =====
+// ===== API: 웹 검색 =====
 async function zaiWebSearch(query, options = {}) {
   const body = {
     search_engine: 'search-prime',
@@ -336,7 +336,7 @@ async function zaiWebSearch(query, options = {}) {
   return apiPost(`${CFG.apiPrefix}/web_search`, body);
 }
 
-// ===== z.ai API: 웹 리더 =====
+// ===== API: 웹 리더 =====
 async function zaiWebRead(url, options = {}) {
   const body = {
     url,
@@ -349,7 +349,7 @@ async function zaiWebRead(url, options = {}) {
   return apiPost(`${CFG.apiPrefix}/reader`, body);
 }
 
-// ===== z.ai API: 이미지 생성 =====
+// ===== API: 이미지 생성 =====
 async function zaiGenerateImage(prompt, options = {}) {
   const body = {
     model: options.model || 'cogView-4-250304',
@@ -360,7 +360,7 @@ async function zaiGenerateImage(prompt, options = {}) {
   return apiPost(`${CFG.apiPrefix}/images/generations`, body);
 }
 
-// ===== z.ai API: 비디오 생성 (비동기) =====
+// ===== API: 비디오 생성 (비동기) =====
 async function zaiGenerateVideo(prompt, options = {}) {
   const body = {
     model: options.model || 'cogvideox-3',
@@ -375,12 +375,12 @@ async function zaiGenerateVideo(prompt, options = {}) {
   return apiPost(`${CFG.apiPrefix}/videos/generations`, body);
 }
 
-// ===== z.ai API: 비동기 결과 조회 =====
+// ===== API: 비동기 결과 조회 =====
 async function zaiAsyncResult(taskId) {
   return apiGet(`${CFG.apiPrefix}/async-result/${taskId}`);
 }
 
-// ===== z.ai API: 비동기 폴링 =====
+// ===== API: 비동기 폴링 =====
 async function zaiPollResult(taskId, intervalMs, timeoutMs) {
   intervalMs = intervalMs || 5000;
   timeoutMs = timeoutMs || 300000;
@@ -395,7 +395,7 @@ async function zaiPollResult(taskId, intervalMs, timeoutMs) {
   throw new Error('폴링 타임아웃 (5분)');
 }
 
-// ===== z.ai API: 음성 인식 =====
+// ===== API: 음성 인식 =====
 async function zaiTranscribeAudio(filePath, options = {}) {
   const fullPath = path.resolve(CFG.workspace, filePath);
   const fileData = fs.readFileSync(fullPath);
@@ -408,24 +408,24 @@ async function zaiTranscribeAudio(filePath, options = {}) {
   return apiPostMultipart(`${CFG.apiPrefix}/audio/transcriptions`, fields, files);
 }
 
-// ===== z.ai API: OCR 레이아웃 파싱 =====
+// ===== API: OCR 레이아웃 파싱 =====
 async function zaiLayoutParsing(fileUrl) {
   return apiPost(`${CFG.apiPrefix}/layout_parsing`, { model: 'glm-ocr', file: fileUrl });
 }
 
-// ===== z.ai API: 임베딩 =====
+// ===== API: 임베딩 =====
 async function zaiEmbed(input, options = {}) {
   const body = { model: options.model || 'embedding-3', input };
   if (options.dimensions) body.dimensions = options.dimensions;
   return apiPost(`${CFG.apiPrefix}/embeddings`, body);
 }
 
-// ===== z.ai API: 토크나이저 =====
+// ===== API: 토크나이저 =====
 async function zaiTokenize(messages) {
   return apiPost(`${CFG.apiPrefix}/tokenizer`, { model: CFG.model, messages });
 }
 
-// ===== z.ai API: 파일 업로드 =====
+// ===== API: 파일 업로드 =====
 async function zaiUploadFile(filePath, purpose) {
   const fullPath = path.resolve(CFG.workspace, filePath);
   const fileData = fs.readFileSync(fullPath);
@@ -860,7 +860,7 @@ function printErrorHint(error) {
   if (msg.includes('타임아웃')) console.error(`  ${c.yellow}힌트: /clear 로 대화 초기화${c.reset}`);
   else if (msg.includes('401') || msg.includes('403')) console.error(`  ${c.yellow}힌트: export ZAI_API_KEY="your-key"${c.reset}`);
   else if (msg.includes('429')) console.error(`  ${c.yellow}힌트: 요청 한도 초과, 잠시 후 재시도${c.reset}`);
-  else if (msg.includes('500') || msg.includes('502') || msg.includes('503')) console.error(`  ${c.yellow}힌트: z.ai 서비스 상태 확인${c.reset}`);
+  else if (msg.includes('500') || msg.includes('502') || msg.includes('503')) console.error(`  ${c.yellow}힌트: API 서비스 상태 확인${c.reset}`);
 }
 
 // ===== 슬래시 명령어 =====
@@ -933,7 +933,7 @@ async function handleSlashCommand(input, rl) {
       break;
 
     case 'zsearch': case 'zs':
-      if (!arg) { console.log(`  사용법: /zsearch <검색어>  (z.ai search-prime)\n`); break; }
+      if (!arg) { console.log(`  사용법: /zsearch <검색어>  (search-prime)\n`); break; }
       await cmdSearchZai(arg);
       break;
 
@@ -1036,12 +1036,12 @@ async function cmdSearchDDG(query) {
 
 async function cmdSearchZai(query) {
   try {
-    process.stdout.write(`${c.dim}z.ai 검색중 (search-prime)...${c.reset}`);
+    process.stdout.write(`${c.dim}검색중 (search-prime)...${c.reset}`);
     const res = await zaiWebSearch(query);
     process.stdout.write('\r\x1b[K');
     const results = res.search_result || [];
     if (!results.length) { console.log(`${c.yellow}검색 결과 없음${c.reset}\n`); return; }
-    console.log(`${c.bold}z.ai 검색: "${query}"${c.reset} (${results.length}건)\n`);
+    console.log(`${c.bold}검색: "${query}"${c.reset} (${results.length}건)\n`);
     for (const r of results.slice(0, 10)) {
       console.log(`  ${c.cyan}${r.title}${c.reset}`);
       if (r.content) console.log(`  ${c.dim}${r.content.slice(0, 150)}${c.reset}`);
@@ -1412,10 +1412,10 @@ ${c.cyan}설정${c.reset}
   /config [키 값] 설정 보기/변경
   /config save    설정 파일로 저장
 
-${c.cyan}z.ai API / 검색${c.reset}
+${c.cyan}API / 검색${c.reset}
   /search <검색어>    웹 검색 (DuckDuckGo)
-  /zsearch <검색어>   웹 검색 (z.ai search-prime, 중국어 특화)
-  /read <URL>         URL 읽기 (z.ai 웹 리더)
+  /zsearch <검색어>   웹 검색 (search-prime)
+  /read <URL>         URL 읽기 (웹 리더)
   /image <프롬프트>   이미지 생성 [--size WxH]
   /video <프롬프트>   비디오 생성 [--audio] [--duration N] [--fps N]
   /poll <작업ID>      비동기 작업 결과 조회
@@ -1589,7 +1589,7 @@ run_with_approval로 실행 가능한 명령:
   }
 
   if (CFG.webSearch) {
-    systemPrompt += `z.ai 내장 웹 검색이 활성화되어 있습니다. (중국 엔진 기반, /websearch 로 토글)\n`;
+    systemPrompt += `내장 웹 검색이 활성화되어 있습니다. (/websearch 로 토글)\n`;
   }
 
   systemPrompt += '한국어로 답변하세요.';

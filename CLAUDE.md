@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Light-zai is a **lightweight CLI chatbot** built in Node.js that interfaces with the **z.ai API** (GLM-5 model). Designed to run on **ARM7L devices** (Raspberry Pi, etc.) and other low-resource environments, it uses **zero external dependencies** — only Node.js built-in modules. It serves as an all-in-one coding assistant with dual-mode operation (AI chat + Bash shell), optional tool calling, and web search capabilities. The primary language for UI and prompts is **Korean**.
+Light-zai is a **lightweight CLI chatbot** built in Node.js that interfaces with **OpenAI-compatible APIs**. Designed to run on **ARM7L devices** (Raspberry Pi, etc.) and other low-resource environments, it uses **zero external dependencies** — only Node.js built-in modules. It serves as an all-in-one coding assistant with dual-mode operation (AI chat + Bash shell), optional tool calling, and web search capabilities. The primary language for UI and prompts is **Korean**.
 
 ### Design Philosophy
 
@@ -32,7 +32,7 @@ The entire application is in `index.js` (~400 lines) and follows a sequential, s
 | Tool definitions (`TOOLS`) | OpenAI-compatible function-calling schema for 4 tools |
 | Utility functions | `debugLog`, `executeBashCommand` |
 | Tool implementations | `readFile`, `writeFile`, `webSearch`, `executeTool` |
-| API layer | `callZaiAPI` — raw HTTPS request to z.ai |
+| API layer | `callZaiAPI` — raw HTTPS request to API server |
 | Message handling | `sendMessage` — orchestrates tool-calling loop |
 | REPL / main | `main()` — readline-based interactive loop |
 
@@ -40,7 +40,7 @@ The entire application is in `index.js` (~400 lines) and follows a sequential, s
 
 - **Single-file architecture**: No modules, no build step, no transpilation. Run directly with `node index.js`.
 - **Environment-driven configuration**: All settings controlled via environment variables (see below).
-- **OpenAI-compatible API**: The z.ai endpoint follows the OpenAI chat completions format (`messages`, `tools`, `tool_calls`).
+- **OpenAI-compatible API**: The API endpoint follows the OpenAI chat completions format (`messages`, `tools`, `tool_calls`).
 - **Dual-mode REPL**: Toggle between AI chat mode and raw Bash mode with `!`.
 - **Conversation history**: All messages (including bash command results) are appended to `conversationHistory[]` for multi-turn context.
 
@@ -48,8 +48,8 @@ The entire application is in `index.js` (~400 lines) and follows a sequential, s
 
 | Variable | Default | Description |
 |---|---|---|
-| `ZAI_API_KEY` | *(required)* | API key for z.ai |
-| `MODEL` | `glm-5` | Model identifier |
+| `ZAI_API_KEY` | *(required)* | API key |
+| `MODEL` | *(default model)* | Model identifier |
 | `WORKSPACE` | `process.cwd()` | Working directory for file/command operations |
 | `ENABLE_TOOLS` | `0` | Set to `1` to enable tool calling (read/write files, execute commands, web search) |
 | `DEBUG` | `0` | Set to `1` for verbose logging |
@@ -109,7 +109,7 @@ The tool-calling flow follows OpenAI's function-calling protocol:
 2. **No external dependencies**. The project deliberately uses only Node.js built-in modules. Do not add npm dependencies.
 3. **Maintain Korean UI strings**. All user-facing console output is in Korean. Keep this consistent.
 4. **Environment variables for config**. Never hardcode API keys or configuration. Always use `process.env`.
-5. **OpenAI-compatible format**. The API payload structure must stay compatible with OpenAI's chat completions format since z.ai follows that standard.
+5. **OpenAI-compatible format**. The API payload structure must stay compatible with OpenAI's chat completions format.
 6. **Preserve the dual-mode REPL**. The `!` bash toggle and `/command` system are core UX features.
 7. **Conversation history integrity**. All interactions (AI responses, bash outputs, tool results) must be recorded in `conversationHistory` for multi-turn context.
 8. **Command execution safety**. `executeBashCommand` has a 30s timeout and 10MB buffer limit. Respect these boundaries.
