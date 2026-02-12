@@ -1552,7 +1552,7 @@ async function main() {
   const dateStr = now.toLocaleDateString('ko-KR', { year:'numeric', month:'long', day:'numeric', weekday:'long' });
   const timeStr = now.toLocaleTimeString('ko-KR', { hour:'2-digit', minute:'2-digit', hour12: false });
 
-  let systemPrompt = `당신은 전문적인 코딩 어시스턴트입니다.
+  let systemPrompt = `당신은 전문적인 범용 AI 어시스턴트입니다. 코딩, 글쓰기, 분석, 질의응답, 창작 등 모든 분야의 요청을 처리할 수 있습니다.
 
 현재 날짜와 시간: ${dateStr} ${timeStr}
 작업 디렉토리: ${CFG.workspace}
