@@ -20,6 +20,8 @@ const APP_NAME = 'Light-zai';
 const CONFIG_DIR = path.join(os.homedir(), '.config', 'light-zai');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 const SESSIONS_DIR = path.join(CONFIG_DIR, 'sessions');
+const PRESETS_DIR = path.join(CONFIG_DIR, 'presets');
+const MCP_CONFIG_FILE = path.join(CONFIG_DIR, 'mcp.json');
 
 // ===== ANSI 색상 =====
 const IS_TTY = process.stdout.isTTY;
@@ -91,6 +93,8 @@ let bashMode = false;
 const conversationHistory = [];
 let lastUsage = null;
 let _rl = null; // REPL readline 인스턴스 (승인 프롬프트용)
+let mcpServers = {}; // { name: { url, tools: [...], sessionId } }
+let activePreset = null; // { name, content }
 
 // ===== 유틸리티 =====
 function debugLog(...args) { if (CFG.debug) console.log(`${c.dim}[DEBUG]${c.reset}`, ...args); }
@@ -294,7 +298,7 @@ async function zaiChat(messages, options = {}) {
   // 도구 구성
   const tools = [];
   if (CFG.webSearch) tools.push({ type: 'web_search', web_search: { enable: true, search_engine: 'search-prime', search_result: true } });
-  if (CFG.tools) tools.push(...FUNCTION_TOOLS);
+  if (CFG.tools) { tools.push(...FUNCTION_TOOLS); tools.push(...getMcpFunctionTools()); }
   if (tools.length > 0) payload.tools = tools;
   if (options.tools) payload.tools = options.tools;
   if (options.stop) payload.stop = options.stop;
@@ -317,7 +321,7 @@ async function zaiChatStream(messages, callbacks, options = {}) {
 
   const tools = [];
   if (CFG.webSearch) tools.push({ type: 'web_search', web_search: { enable: true, search_engine: 'search-prime', search_result: true } });
-  if (CFG.tools) tools.push(...FUNCTION_TOOLS);
+  if (CFG.tools) { tools.push(...FUNCTION_TOOLS); tools.push(...getMcpFunctionTools()); }
   if (tools.length > 0) payload.tools = tools;
   if (options.tools) payload.tools = options.tools;
 
@@ -502,6 +506,250 @@ function duckDuckGoSearch(query) {
     req.write(postData);
     req.end();
   });
+}
+
+// ===== 시스템 프롬프트 빌더 =====
+function buildSystemPrompt() {
+  const now = new Date();
+  const dateStr = now.toLocaleDateString('ko-KR', { year:'numeric', month:'long', day:'numeric', weekday:'long' });
+  const timeStr = now.toLocaleTimeString('ko-KR', { hour:'2-digit', minute:'2-digit', hour12: false });
+
+  let prompt = `당신은 전문적인 범용 AI 어시스턴트입니다. 코딩, 글쓰기, 분석, 질의응답, 창작 등 모든 분야의 요청을 처리할 수 있습니다.
+
+현재 날짜와 시간: ${dateStr} ${timeStr}
+작업 디렉토리: ${CFG.workspace}
+`;
+
+  // 프리셋 적용
+  if (activePreset) {
+    prompt += `\n${activePreset.content}\n`;
+  }
+
+  if (CFG.tools) {
+    prompt += `
+사용 가능한 도구:
+- read_file: 파일 읽기 (워크스페이스 기준 상대/절대 경로)
+- write_file: 파일 쓰기 (디렉토리 자동 생성)
+- execute_command: 셸 명령 실행 (30초 타임아웃)
+- web_search: 인터넷 검색 (DuckDuckGo, 최신 정보/실시간 데이터)
+- web_read: URL 내용을 마크다운으로 읽기
+- generate_image: 텍스트로 이미지 생성
+- run_with_approval: 사용자 승인 후 명령 실행 (아래 참고)
+
+run_with_approval로 실행 가능한 명령:
+  /image <프롬프트> — 이미지 생성
+  /video <프롬프트> — 비디오 생성
+  /ocr <이미지URL> — OCR 텍스트 추출
+  /embed <텍스트> — 텍스트 임베딩
+  /upload <파일경로> — 파일 업로드
+  /transcribe <오디오파일> — 음성 인식
+  /search <검색어> — 웹 검색
+  /read <URL> — URL 읽기
+  bash 명령도 가능 (예: ffmpeg, curl 등)
+
+파일을 읽을 때는 반드시 read_file 도구를 사용하세요. bash 명령어를 텍스트로 출력하지 마세요.
+사용자에게 부담이 되는 복잡한 명령은 run_with_approval로 대신 입력해주세요.
+최신 정보가 필요하면 web_search를 적극 활용하세요.
+`;
+
+    // MCP 도구 설명 추가
+    const mcpTools = getMcpFunctionTools();
+    if (mcpTools.length > 0) {
+      prompt += `\nMCP 서버 도구:\n`;
+      for (const t of mcpTools) {
+        prompt += `- ${t.function.name}: ${t.function.description || '(설명 없음)'}\n`;
+      }
+    }
+  }
+
+  if (CFG.webSearch) {
+    prompt += `내장 웹 검색이 활성화되어 있습니다. (/websearch 로 토글)\n`;
+  }
+
+  prompt += '한국어로 답변하세요.';
+  return prompt;
+}
+
+// ===== 프리셋 관리 =====
+function listPresets() {
+  ensureDir(PRESETS_DIR);
+  return fs.readdirSync(PRESETS_DIR).filter(f => f.endsWith('.txt') || f.endsWith('.md')).map(f => f.replace(/\.(txt|md)$/, ''));
+}
+
+function loadPresetFile(name) {
+  const txtPath = path.join(PRESETS_DIR, `${name}.txt`);
+  const mdPath = path.join(PRESETS_DIR, `${name}.md`);
+  if (fs.existsSync(txtPath)) return fs.readFileSync(txtPath, 'utf-8');
+  if (fs.existsSync(mdPath)) return fs.readFileSync(mdPath, 'utf-8');
+  return null;
+}
+
+function savePresetFile(name, content) {
+  ensureDir(PRESETS_DIR);
+  fs.writeFileSync(path.join(PRESETS_DIR, `${name}.txt`), content, 'utf-8');
+}
+
+function applyPreset(name) {
+  const content = loadPresetFile(name);
+  if (!content) return false;
+  activePreset = { name, content };
+  // 시스템 프롬프트 재구성
+  if (conversationHistory.length > 0 && conversationHistory[0].role === 'system') {
+    conversationHistory[0].content = buildSystemPrompt();
+  }
+  return true;
+}
+
+function clearPreset() {
+  activePreset = null;
+  if (conversationHistory.length > 0 && conversationHistory[0].role === 'system') {
+    conversationHistory[0].content = buildSystemPrompt();
+  }
+}
+
+// ===== MCP 클라이언트 (HTTP only) =====
+function loadMcpConfig() {
+  try {
+    if (fs.existsSync(MCP_CONFIG_FILE)) return JSON.parse(fs.readFileSync(MCP_CONFIG_FILE, 'utf-8'));
+  } catch (_) {}
+  return { servers: {} };
+}
+
+function saveMcpConfig(config) {
+  ensureDir(CONFIG_DIR);
+  fs.writeFileSync(MCP_CONFIG_FILE, JSON.stringify(config, null, 2), 'utf-8');
+}
+
+function mcpRequest(serverUrl, method, params = {}, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(serverUrl);
+    const mod = url.protocol === 'https:' ? https : http;
+    const body = JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method, params });
+    const opts = {
+      hostname: url.hostname,
+      port: url.port || (url.protocol === 'https:' ? 443 : 80),
+      path: url.pathname + url.search,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json, text/event-stream',
+        'Content-Length': Buffer.byteLength(body),
+        ...headers,
+      },
+      timeout: 30000,
+    };
+    const req = mod.request(opts, (res) => {
+      let data = '';
+      res.on('data', (chunk) => data += chunk);
+      res.on('end', () => {
+        try {
+          const contentType = res.headers['content-type'] || '';
+          if (contentType.includes('text/event-stream')) {
+            // SSE 응답 파싱
+            const lines = data.split('\n');
+            for (const line of lines) {
+              if (line.startsWith('data:')) {
+                const payload = line.slice(5).trim();
+                if (payload && payload !== '[DONE]') {
+                  const parsed = JSON.parse(payload);
+                  if (parsed.result !== undefined || parsed.error) { resolve(parsed); return; }
+                }
+              }
+            }
+            reject(new Error('SSE 응답에서 결과를 찾을 수 없음'));
+          } else {
+            resolve(JSON.parse(data));
+          }
+        } catch (e) {
+          reject(new Error(`MCP 응답 파싱 실패: ${e.message}`));
+        }
+      });
+    });
+    req.on('error', (e) => reject(new Error(`MCP 연결 실패: ${e.message}`)));
+    req.on('timeout', () => { req.destroy(); reject(new Error('MCP 타임아웃')); });
+    req.write(body);
+    req.end();
+  });
+}
+
+async function mcpConnect(name, url) {
+  debugLog(`MCP 연결: ${name} → ${url}`);
+  const headers = {};
+
+  // 초기화
+  const initRes = await mcpRequest(url, 'initialize', {
+    protocolVersion: '2025-03-26',
+    capabilities: {},
+    clientInfo: { name: APP_NAME, version: VERSION },
+  }, headers);
+
+  if (initRes.error) throw new Error(`MCP 초기화 실패: ${initRes.error.message}`);
+
+  const sessionId = initRes._meta?.sessionId || null;
+  if (sessionId) headers['Mcp-Session-Id'] = sessionId;
+
+  // initialized 알림
+  await mcpRequest(url, 'notifications/initialized', {}, headers).catch(() => {});
+
+  // 도구 목록 조회
+  const toolsRes = await mcpRequest(url, 'tools/list', {}, headers);
+  const tools = toolsRes.result?.tools || [];
+
+  mcpServers[name] = { url, tools, sessionId, headers };
+  debugLog(`MCP ${name}: ${tools.length}개 도구 발견`);
+  return tools;
+}
+
+async function mcpDisconnect(name) {
+  if (mcpServers[name]) {
+    delete mcpServers[name];
+    debugLog(`MCP 연결 해제: ${name}`);
+  }
+}
+
+async function mcpCallTool(serverName, toolName, args) {
+  const server = mcpServers[serverName];
+  if (!server) throw new Error(`MCP 서버 없음: ${serverName}`);
+
+  const res = await mcpRequest(server.url, 'tools/call', {
+    name: toolName,
+    arguments: args,
+  }, server.headers || {});
+
+  if (res.error) throw new Error(`MCP 도구 오류: ${res.error.message}`);
+  return res.result;
+}
+
+// MCP 도구를 OpenAI function calling 형식으로 변환
+function getMcpFunctionTools() {
+  const tools = [];
+  for (const [serverName, server] of Object.entries(mcpServers)) {
+    for (const tool of server.tools) {
+      tools.push({
+        type: 'function',
+        function: {
+          name: `mcp__${serverName}__${tool.name}`,
+          description: tool.description || '',
+          parameters: tool.inputSchema || { type: 'object', properties: {} },
+        },
+      });
+    }
+  }
+  return tools;
+}
+
+// 시작 시 설정된 MCP 서버에 자동 연결
+async function mcpAutoConnect() {
+  const config = loadMcpConfig();
+  const servers = config.servers || {};
+  for (const [name, cfg] of Object.entries(servers)) {
+    try {
+      const tools = await mcpConnect(name, cfg.url);
+      console.log(`  ${c.green}MCP${c.reset} ${name}: ${tools.length}개 도구 연결됨`);
+    } catch (e) {
+      console.log(`  ${c.red}MCP${c.reset} ${name}: 연결 실패 - ${e.message}`);
+    }
+  }
 }
 
 // ===== 사용자 승인 프롬프트 =====
@@ -724,10 +972,26 @@ async function executeTool(toolName, args) {
       }
       break;
     }
-    default:
-      result = { success: false, error: `알 수 없는 도구: ${toolName}` };
+    default: {
+      // MCP 도구 처리 (mcp__서버명__도구명)
+      const mcpMatch = toolName.match(/^mcp__([^_]+)__(.+)$/);
+      if (mcpMatch) {
+        const [, serverName, mcpToolName] = mcpMatch;
+        try {
+          const mcpResult = await mcpCallTool(serverName, mcpToolName, args);
+          // MCP 결과를 텍스트로 변환
+          const content = mcpResult.content || [];
+          const text = content.map(c => c.type === 'text' ? c.text : JSON.stringify(c)).join('\n');
+          result = { success: !mcpResult.isError, output: text || JSON.stringify(mcpResult) };
+        } catch (e) {
+          result = { success: false, error: e.message };
+        }
+      } else {
+        result = { success: false, error: `알 수 없는 도구: ${toolName}` };
+      }
+    }
   }
-  console.log(`  ${result.success ? c.green + '성공' : c.red + '실패'}${c.reset}`);
+  console.log(`  ${result.success !== false ? c.green + '성공' : c.red + '실패'}${c.reset}`);
   return result;
 }
 
@@ -1006,6 +1270,14 @@ async function handleSlashCommand(input, rl) {
 
     case 'doctor': case 'diag':
       await cmdDoctor();
+      break;
+
+    case 'preset': case 'p':
+      await cmdPreset(arg);
+      break;
+
+    case 'mcp':
+      await cmdMcp(arg);
       break;
 
     default:
@@ -1387,6 +1659,212 @@ async function cmdDoctor() {
   console.log('');
 }
 
+// ===== 프리셋 명령어 =====
+async function cmdPreset(arg) {
+  const parts = arg ? arg.split(/\s+/) : [];
+  const sub = parts[0] || '';
+  const name = parts.slice(1).join(' ').trim();
+
+  switch (sub) {
+    case '':
+    case 'list': {
+      const presets = listPresets();
+      if (!presets.length) {
+        console.log(`${c.dim}저장된 프리셋이 없습니다${c.reset}`);
+        console.log(`  ${c.dim}프리셋 디렉토리: ${PRESETS_DIR}${c.reset}`);
+        console.log(`  ${c.dim}.txt 또는 .md 파일을 넣거나 /preset save <이름> 으로 생성${c.reset}\n`);
+        return;
+      }
+      console.log(`\n${c.bold}프리셋 목록:${c.reset}\n`);
+      for (const p of presets) {
+        const marker = activePreset?.name === p ? ` ${c.green}<- 활성${c.reset}` : '';
+        const content = loadPresetFile(p);
+        const preview = content ? content.split('\n')[0].slice(0, 60) : '';
+        console.log(`  ${c.cyan}${p.padEnd(20)}${c.reset} ${c.dim}${preview}${c.reset}${marker}`);
+      }
+      console.log(`\n  사용법: /preset load <이름> | /preset save <이름> | /preset off\n`);
+      break;
+    }
+    case 'load': case 'use': {
+      if (!name) { console.log(`${c.yellow}이름이 필요합니다${c.reset}: /preset load <이름>\n`); return; }
+      if (applyPreset(name)) {
+        console.log(`${c.green}프리셋 적용: ${name}${c.reset}\n`);
+      } else {
+        console.log(`${c.red}프리셋 없음: ${name}${c.reset}\n`);
+        const presets = listPresets();
+        if (presets.length) console.log(`  사용 가능: ${presets.join(', ')}\n`);
+      }
+      break;
+    }
+    case 'save': {
+      if (!name) { console.log(`${c.yellow}이름이 필요합니다${c.reset}: /preset save <이름>\n`); return; }
+      // 현재 대화에서 AI에게 프리셋 내용을 요청하거나, 직접 입력
+      console.log(`${c.cyan}프리셋 내용을 입력하세요 (빈 줄로 종료):${c.reset}`);
+      const lines = [];
+      const collectLine = () => new Promise(resolve => {
+        if (_rl) _rl.question('  ', answer => resolve(answer));
+        else resolve(null);
+      });
+      while (true) {
+        const line = await collectLine();
+        if (line === null || line === '') break;
+        lines.push(line);
+      }
+      if (lines.length === 0) { console.log(`${c.dim}취소됨${c.reset}\n`); return; }
+      savePresetFile(name, lines.join('\n'));
+      console.log(`${c.green}프리셋 저장: ${name}${c.reset}`);
+      console.log(`  ${c.dim}${path.join(PRESETS_DIR, name + '.txt')}${c.reset}\n`);
+      break;
+    }
+    case 'off': case 'clear': case 'none': {
+      if (activePreset) {
+        console.log(`${c.green}프리셋 해제: ${activePreset.name}${c.reset}\n`);
+        clearPreset();
+      } else {
+        console.log(`${c.dim}활성 프리셋 없음${c.reset}\n`);
+      }
+      break;
+    }
+    case 'show': {
+      if (!activePreset) { console.log(`${c.dim}활성 프리셋 없음${c.reset}\n`); return; }
+      console.log(`\n${c.bold}프리셋: ${activePreset.name}${c.reset}\n`);
+      console.log(activePreset.content);
+      console.log('');
+      break;
+    }
+    case 'delete': case 'rm': {
+      if (!name) { console.log(`${c.yellow}이름이 필요합니다${c.reset}: /preset delete <이름>\n`); return; }
+      const txtPath = path.join(PRESETS_DIR, `${name}.txt`);
+      const mdPath = path.join(PRESETS_DIR, `${name}.md`);
+      if (fs.existsSync(txtPath)) { fs.unlinkSync(txtPath); }
+      else if (fs.existsSync(mdPath)) { fs.unlinkSync(mdPath); }
+      else { console.log(`${c.red}프리셋 없음: ${name}${c.reset}\n`); return; }
+      if (activePreset?.name === name) clearPreset();
+      console.log(`${c.green}프리셋 삭제: ${name}${c.reset}\n`);
+      break;
+    }
+    default:
+      // 인자가 프리셋 이름이면 바로 로드
+      if (applyPreset(sub)) {
+        console.log(`${c.green}프리셋 적용: ${sub}${c.reset}\n`);
+      } else {
+        console.log(`  사용법: /preset [list|load|save|show|off|delete] [이름]\n`);
+      }
+  }
+}
+
+// ===== MCP 명령어 =====
+async function cmdMcp(arg) {
+  const parts = arg ? arg.split(/\s+/) : [];
+  const sub = parts[0] || '';
+  const name = parts[1] || '';
+  const url = parts[2] || '';
+
+  switch (sub) {
+    case '':
+    case 'list': {
+      const config = loadMcpConfig();
+      const configServers = Object.keys(config.servers || {});
+      const connectedServers = Object.keys(mcpServers);
+
+      if (!configServers.length && !connectedServers.length) {
+        console.log(`${c.dim}등록된 MCP 서버가 없습니다${c.reset}`);
+        console.log(`  ${c.dim}추가: /mcp add <이름> <URL>${c.reset}\n`);
+        return;
+      }
+
+      console.log(`\n${c.bold}MCP 서버:${c.reset}\n`);
+      for (const sname of configServers) {
+        const connected = mcpServers[sname];
+        const surl = config.servers[sname].url;
+        const toolCount = connected ? connected.tools.length : 0;
+        const status = connected ? `${c.green}연결됨${c.reset} (${toolCount}개 도구)` : `${c.dim}연결 안됨${c.reset}`;
+        console.log(`  ${c.cyan}${sname.padEnd(15)}${c.reset} ${status}`);
+        console.log(`  ${c.dim}${' '.repeat(15)} ${surl}${c.reset}`);
+        if (connected) {
+          for (const t of connected.tools) {
+            console.log(`  ${' '.repeat(15)} ${c.magenta}${t.name}${c.reset} ${c.dim}${(t.description || '').slice(0, 50)}${c.reset}`);
+          }
+        }
+      }
+      console.log(`\n  사용법: /mcp add <이름> <URL> | /mcp remove <이름> | /mcp connect <이름>\n`);
+      break;
+    }
+    case 'add': {
+      if (!name || !url) { console.log(`${c.yellow}사용법: /mcp add <이름> <URL>${c.reset}\n`); return; }
+      const config = loadMcpConfig();
+      config.servers = config.servers || {};
+      config.servers[name] = { url };
+      saveMcpConfig(config);
+      console.log(`${c.green}MCP 서버 등록: ${name}${c.reset} → ${url}`);
+
+      // 자동 연결 시도
+      try {
+        const tools = await mcpConnect(name, url);
+        console.log(`  ${c.green}연결 성공${c.reset}: ${tools.length}개 도구`);
+        for (const t of tools) {
+          console.log(`    ${c.magenta}${t.name}${c.reset} ${c.dim}${(t.description || '').slice(0, 60)}${c.reset}`);
+        }
+      } catch (e) {
+        console.log(`  ${c.red}연결 실패${c.reset}: ${e.message}`);
+        console.log(`  ${c.dim}나중에 /mcp connect ${name} 으로 재시도${c.reset}`);
+      }
+      console.log('');
+      break;
+    }
+    case 'remove': case 'rm': case 'delete': {
+      if (!name) { console.log(`${c.yellow}사용법: /mcp remove <이름>${c.reset}\n`); return; }
+      const config = loadMcpConfig();
+      if (config.servers?.[name]) {
+        delete config.servers[name];
+        saveMcpConfig(config);
+      }
+      await mcpDisconnect(name);
+      console.log(`${c.green}MCP 서버 제거: ${name}${c.reset}\n`);
+      break;
+    }
+    case 'connect': {
+      if (!name) { console.log(`${c.yellow}사용법: /mcp connect <이름>${c.reset}\n`); return; }
+      const config = loadMcpConfig();
+      const serverCfg = config.servers?.[name];
+      if (!serverCfg) { console.log(`${c.red}등록되지 않은 서버: ${name}${c.reset}\n`); return; }
+      try {
+        process.stdout.write(`${c.dim}MCP 연결중...${c.reset}`);
+        const tools = await mcpConnect(name, serverCfg.url);
+        process.stdout.write('\r\x1b[K');
+        console.log(`${c.green}MCP 연결: ${name}${c.reset} (${tools.length}개 도구)`);
+        for (const t of tools) {
+          console.log(`  ${c.magenta}${t.name}${c.reset} ${c.dim}${(t.description || '').slice(0, 60)}${c.reset}`);
+        }
+      } catch (e) {
+        process.stdout.write('\r\x1b[K');
+        console.log(`${c.red}MCP 연결 실패: ${e.message}${c.reset}`);
+      }
+      console.log('');
+      break;
+    }
+    case 'disconnect': {
+      if (!name) { console.log(`${c.yellow}사용법: /mcp disconnect <이름>${c.reset}\n`); return; }
+      await mcpDisconnect(name);
+      console.log(`${c.green}MCP 연결 해제: ${name}${c.reset}\n`);
+      break;
+    }
+    case 'tools': {
+      const mcpTools = getMcpFunctionTools();
+      if (!mcpTools.length) { console.log(`${c.dim}연결된 MCP 도구 없음${c.reset}\n`); return; }
+      console.log(`\n${c.bold}MCP 도구 목록:${c.reset}\n`);
+      for (const t of mcpTools) {
+        console.log(`  ${c.magenta}${t.function.name}${c.reset}`);
+        if (t.function.description) console.log(`    ${c.dim}${t.function.description.slice(0, 80)}${c.reset}`);
+      }
+      console.log('');
+      break;
+    }
+    default:
+      console.log(`  사용법: /mcp [list|add|remove|connect|disconnect|tools]\n`);
+  }
+}
+
 function printHelp() {
   console.log(`
 ${c.bold}=== Light-zai v${VERSION} 명령어 ===${c.reset}
@@ -1422,6 +1900,22 @@ ${c.cyan}API / 검색${c.reset}
   /upload <파일>      파일 업로드
   /transcribe <파일>  음성 인식 (ASR)
 
+${c.cyan}프리셋${c.reset}
+  /preset         프리셋 목록
+  /preset load <이름>  프리셋 적용
+  /preset save <이름>  프리셋 저장
+  /preset show    활성 프리셋 보기
+  /preset off     프리셋 해제
+  /preset delete <이름> 프리셋 삭제
+
+${c.cyan}MCP 서버${c.reset}
+  /mcp            MCP 서버 목록
+  /mcp add <이름> <URL>  서버 등록+연결
+  /mcp remove <이름>     서버 제거
+  /mcp connect <이름>    서버 연결
+  /mcp disconnect <이름> 서버 연결 해제
+  /mcp tools      연결된 MCP 도구 목록
+
 ${c.cyan}기타${c.reset}
   /doctor         시스템 진단
   /status         현재 상태
@@ -1444,6 +1938,8 @@ ${c.bold}현재 상태${c.reset}
   도구:     ${CFG.tools ? c.green + 'ON' : c.dim + 'OFF'}${c.reset}
   웹검색:   ${CFG.webSearch ? c.green + 'ON' : c.dim + 'OFF'}${c.reset}
   JSON:     ${CFG.jsonMode ? c.green + 'ON' : c.dim + 'OFF'}${c.reset}
+  프리셋:   ${activePreset ? c.green + activePreset.name + c.reset : c.dim + 'OFF' + c.reset}
+  MCP:      ${Object.keys(mcpServers).length > 0 ? c.green + Object.keys(mcpServers).join(', ') + c.reset + ` (${getMcpFunctionTools().length}개 도구)` : c.dim + '없음' + c.reset}
   디렉토리: ${CFG.workspace}${lastUsage ? `\n  마지막 토큰: 입력 ${lastUsage.prompt_tokens || '?'} + 출력 ${lastUsage.completion_tokens || '?'} = 합계 ${lastUsage.total_tokens || '?'}` : ''}
 `);
 }
@@ -1547,51 +2043,18 @@ async function main() {
   // ===== REPL 모드 =====
   showSplash();
 
-  // 시스템 프롬프트
-  const now = new Date();
-  const dateStr = now.toLocaleDateString('ko-KR', { year:'numeric', month:'long', day:'numeric', weekday:'long' });
-  const timeStr = now.toLocaleTimeString('ko-KR', { hour:'2-digit', minute:'2-digit', hour12: false });
+  // 시스템 프롬프트 (buildSystemPrompt 사용)
+  conversationHistory.push({ role: 'system', content: buildSystemPrompt() });
 
-  let systemPrompt = `당신은 전문적인 범용 AI 어시스턴트입니다. 코딩, 글쓰기, 분석, 질의응답, 창작 등 모든 분야의 요청을 처리할 수 있습니다.
-
-현재 날짜와 시간: ${dateStr} ${timeStr}
-작업 디렉토리: ${CFG.workspace}
-`;
-
-  if (CFG.tools) {
-    systemPrompt += `
-사용 가능한 도구:
-- read_file: 파일 읽기 (워크스페이스 기준 상대/절대 경로)
-- write_file: 파일 쓰기 (디렉토리 자동 생성)
-- execute_command: 셸 명령 실행 (30초 타임아웃)
-- web_search: 인터넷 검색 (DuckDuckGo, 최신 정보/실시간 데이터)
-- web_read: URL 내용을 마크다운으로 읽기
-- generate_image: 텍스트로 이미지 생성
-- run_with_approval: 사용자 승인 후 명령 실행 (아래 참고)
-
-run_with_approval로 실행 가능한 명령:
-  /image <프롬프트> — 이미지 생성
-  /video <프롬프트> — 비디오 생성
-  /ocr <이미지URL> — OCR 텍스트 추출
-  /embed <텍스트> — 텍스트 임베딩
-  /upload <파일경로> — 파일 업로드
-  /transcribe <오디오파일> — 음성 인식
-  /search <검색어> — 웹 검색
-  /read <URL> — URL 읽기
-  bash 명령도 가능 (예: ffmpeg, curl 등)
-
-사용자에게 부담이 되는 복잡한 명령은 run_with_approval로 대신 입력해주세요.
-최신 정보가 필요하면 web_search를 적극 활용하세요.
-`;
+  // MCP 서버 자동 연결
+  const mcpConfig = loadMcpConfig();
+  if (Object.keys(mcpConfig.servers || {}).length > 0) {
+    await mcpAutoConnect();
+    // MCP 도구가 추가됐으면 시스템 프롬프트 갱신
+    if (Object.keys(mcpServers).length > 0) {
+      conversationHistory[0].content = buildSystemPrompt();
+    }
   }
-
-  if (CFG.webSearch) {
-    systemPrompt += `내장 웹 검색이 활성화되어 있습니다. (/websearch 로 토글)\n`;
-  }
-
-  systemPrompt += '한국어로 답변하세요.';
-
-  conversationHistory.push({ role: 'system', content: systemPrompt });
 
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   _rl = rl;
