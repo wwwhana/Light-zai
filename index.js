@@ -1123,18 +1123,33 @@ async function executeTool(toolName, args) {
       break;
     }
     case 'write_file': {
-      try {
-        const fullPath = path.resolve(CFG.workspace, args.path);
-        const dir = path.dirname(fullPath);
-        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-        fs.writeFileSync(fullPath, args.content, 'utf-8');
-        result = { success: true, path: fullPath, bytes: Buffer.byteLength(args.content) };
-      } catch (e) { result = { success: false, error: e.message }; }
+      const fullPath = path.resolve(CFG.workspace, args.path);
+      console.log(`  ${c.dim}경로: ${fullPath} (${Buffer.byteLength(args.content)}B)${c.reset}`);
+      const wAnswer = await promptUser(`  파일을 쓸까요? (${c.green}y${c.reset}/${c.red}n${c.reset}) `);
+      if (wAnswer === 'y' || wAnswer === 'yes' || wAnswer === 'ㅛ') {
+        try {
+          const dir = path.dirname(fullPath);
+          if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+          fs.writeFileSync(fullPath, args.content, 'utf-8');
+          result = { success: true, path: fullPath, bytes: Buffer.byteLength(args.content) };
+        } catch (e) { result = { success: false, error: e.message }; }
+      } else {
+        console.log(`  ${c.dim}거부됨${c.reset}`);
+        result = { success: false, denied: true, message: '사용자가 파일 쓰기를 거부했습니다' };
+      }
       break;
     }
-    case 'execute_command':
-      result = await executeBashCommand(args.command);
+    case 'execute_command': {
+      console.log(`  ${c.cyan}${args.command}${c.reset}`);
+      const eAnswer = await promptUser(`  실행할까요? (${c.green}y${c.reset}/${c.red}n${c.reset}) `);
+      if (eAnswer === 'y' || eAnswer === 'yes' || eAnswer === 'ㅛ') {
+        result = await executeBashCommand(args.command);
+      } else {
+        console.log(`  ${c.dim}거부됨${c.reset}`);
+        result = { success: false, denied: true, message: '사용자가 실행을 거부했습니다' };
+      }
       break;
+    }
     case 'web_search': {
       try {
         const sr = await duckDuckGoSearch(args.query);
