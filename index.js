@@ -805,12 +805,13 @@ async function sendMessageStream(startTime) {
   if (isReasoning) process.stdout.write(c.reset);
   if (!isFirstToken) process.stdout.write('\n');
 
-  // 도구 호출 처리
-  if (result.toolCalls && CFG.tools) {
-    const assistantMsg = { role: 'assistant', content: result.content || null, tool_calls: result.toolCalls };
+  // 도구 호출 루프 (sendMessageSync와 동일하게 반복)
+  let current = result;
+  while (current.toolCalls && CFG.tools) {
+    const assistantMsg = { role: 'assistant', content: current.content || null, tool_calls: current.toolCalls };
     conversationHistory.push(assistantMsg);
 
-    for (const tc of result.toolCalls) {
+    for (const tc of current.toolCalls) {
       let toolArgs;
       try { toolArgs = JSON.parse(tc.function.arguments); } catch(_) { toolArgs = {}; }
       const toolResult = await executeTool(tc.function.name, toolArgs);
@@ -820,7 +821,7 @@ async function sendMessageStream(startTime) {
     // 도구 실행 후 재호출 (스트리밍)
     isFirstToken = true;
     isReasoning = false;
-    const result2 = await zaiChatStream(conversationHistory, {
+    current = await zaiChatStream(conversationHistory, {
       onReasoning(token) {
         if (!isReasoning) { process.stdout.write(`${c.dim}[생각] `); isReasoning = true; }
         process.stdout.write(token);
@@ -835,15 +836,11 @@ async function sendMessageStream(startTime) {
     });
     if (isReasoning) process.stdout.write(c.reset);
     if (!isFirstToken) process.stdout.write('\n');
-
-    conversationHistory.push({ role: 'assistant', content: result2.content || '' });
-    debugLog(`응답 시간: ${((Date.now()-startTime)/1000).toFixed(2)}초`);
-    return result2.content;
   }
 
-  conversationHistory.push({ role: 'assistant', content: result.content || '' });
+  conversationHistory.push({ role: 'assistant', content: current.content || '' });
   debugLog(`응답 시간: ${((Date.now()-startTime)/1000).toFixed(2)}초`);
-  return result.content;
+  return current.content;
 }
 
 function printSearchResults(results) {
