@@ -2003,7 +2003,7 @@ async function cmdMcp(arg) {
         }
       }
       console.log(`\n  /mcp add <이름> <URL>              HTTP 서버 등록`);
-      console.log(`  /mcp stdio <이름> <명령> [인자...]  stdio 서버 등록`);
+      console.log(`  /mcp stdio <이름> <명령> [인자...] [--env K=V ...]  stdio 서버 등록`);
       console.log(`  /mcp remove|connect|disconnect|tools\n`);
       break;
     }
@@ -2029,14 +2029,25 @@ async function cmdMcp(arg) {
       break;
     }
     case 'stdio': {
-      // /mcp stdio <이름> <명령> [인자...]
-      if (!name || !rest) { console.log(`${c.yellow}사용법: /mcp stdio <이름> <명령> [인자...]${c.reset}\n`); return; }
+      // /mcp stdio <이름> <명령> [인자...] [--env KEY=VALUE ...]
+      if (!name || !rest) { console.log(`${c.yellow}사용법: /mcp stdio <이름> <명령> [인자...] [--env KEY=VAL ...]${c.reset}\n`); return; }
       const stdioParts = rest.split(/\s+/);
-      const command = stdioParts[0];
-      const cmdArgs = stdioParts.slice(1);
+      const cmdParts = []; const envObj = {};
+      let parsingEnv = false;
+      for (const p of stdioParts) {
+        if (p === '--env') { parsingEnv = true; continue; }
+        if (parsingEnv && p.includes('=')) {
+          const eq = p.indexOf('=');
+          envObj[p.slice(0, eq)] = p.slice(eq + 1);
+        } else { parsingEnv = false; cmdParts.push(p); }
+      }
+      const command = cmdParts[0];
+      const cmdArgs = cmdParts.slice(1);
+      const serverCfg = { command, args: cmdArgs };
+      if (Object.keys(envObj).length > 0) serverCfg.env = envObj;
       const config = loadMcpConfig();
       config.servers = config.servers || {};
-      config.servers[name] = { command, args: cmdArgs };
+      config.servers[name] = serverCfg;
       saveMcpConfig(config);
       console.log(`${c.green}MCP 서버 등록 (stdio): ${name}${c.reset} → ${command} ${cmdArgs.join(' ')}`);
 
@@ -2311,7 +2322,7 @@ ${c.cyan}스킬${c.reset}  ${c.dim}(/<스킬이름> [인자]로 호출)${c.reset
 ${c.cyan}MCP 서버${c.reset}
   /mcp                        서버 목록
   /mcp add <이름> <URL>       HTTP 서버 등록+연결
-  /mcp stdio <이름> <cmd...>  stdio 서버 등록+연결
+  /mcp stdio <이름> <cmd...> [--env K=V ...]  stdio 서버 등록+연결
   /mcp remove <이름>          서버 제거
   /mcp connect <이름>         서버 연결
   /mcp disconnect <이름>      서버 연결 해제
@@ -2399,6 +2410,7 @@ function parseCLIArgs() {
     if (arg === '--read') { result.mode = 'read'; result.value = args[i+1]; return result; }
     if (arg === '--ocr') { result.mode = 'ocr'; result.value = args[i+1]; return result; }
     if (arg === '--embed') { result.mode = 'embed'; result.value = args.slice(i+1).join(' '); return result; }
+    if (arg === '--mcp') { result.mode = 'mcp'; result.value = args.slice(i+1).join(' '); return result; }
     if (!arg.startsWith('-')) {
       result.mode = 'oneshot';
       result.question = args.slice(i).join(' ');
@@ -2431,6 +2443,7 @@ async function main() {
   if (cli.mode === 'read') { await cmdRead(cli.value); return; }
   if (cli.mode === 'ocr') { await cmdOcr(cli.value); return; }
   if (cli.mode === 'embed') { await cmdEmbed(cli.value); return; }
+  if (cli.mode === 'mcp') { await cmdMcp(cli.value); return; }
 
   // 파이프 입력 처리
   if (!IS_TTY) {
