@@ -80,7 +80,7 @@ const CFG = {
   tools:      process.env.ENABLE_TOOLS  !== undefined ? process.env.ENABLE_TOOLS  === '1' : (savedCfg.tools  ?? false),
   stream:     process.env.ENABLE_STREAM !== undefined ? process.env.ENABLE_STREAM !== '0' : (savedCfg.stream ?? true),
   think:      process.env.ENABLE_THINK  !== undefined ? process.env.ENABLE_THINK  === '1' : (savedCfg.think  ?? false),
-  webSearch:  process.env.ENABLE_WEB_SEARCH !== undefined ? process.env.ENABLE_WEB_SEARCH !== '0' : (savedCfg.webSearch ?? true),
+  webSearch:  process.env.ENABLE_WEB_SEARCH !== undefined ? process.env.ENABLE_WEB_SEARCH === '1' : (savedCfg.webSearch ?? false),
   maxTokens:  parseInt(process.env.MAX_TOKENS   || savedCfg.maxTokens  || '4096'),
   temperature:parseFloat(process.env.TEMPERATURE || savedCfg.temperature || '0.7'),
   jsonMode:   false,
@@ -434,6 +434,75 @@ async function zaiUploadFile(filePath, purpose) {
   return apiPostMultipart(`${CFG.apiPrefix}/files`, fields, files);
 }
 
+// ===== DuckDuckGo 검색 (한국어/국제 검색용) =====
+function duckDuckGoSearch(query) {
+  return new Promise((resolve) => {
+    const postData = `q=${encodeURIComponent(query)}&b=&kl=kr-kr`;
+    const options = {
+      hostname: 'html.duckduckgo.com',
+      path: '/html/',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(postData),
+        'User-Agent': 'Mozilla/5.0 (compatible; Light-zai/4.0)',
+      },
+      timeout: 15000,
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        const results = [];
+        const blocks = data.split(/class="result\s/);
+        for (let i = 1; i < blocks.length && results.length < 10; i++) {
+          const block = blocks[i];
+          // URL 추출
+          const urlMatch = block.match(/class="result__a"[^>]*href="([^"]*)"/);
+          if (!urlMatch) continue;
+          let url = urlMatch[1];
+          const uddgMatch = url.match(/uddg=([^&]*)/);
+          if (uddgMatch) url = decodeURIComponent(uddgMatch[1]);
+          // 제목 추출
+          const titleMatch = block.match(/class="result__a"[^>]*>([\s\S]*?)<\/a>/);
+          const title = titleMatch ? titleMatch[1].replace(/<[^>]*>/g, '').trim() : '';
+          // 스니펫 추출
+          const snippetMatch = block.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/a>/);
+          const snippet = snippetMatch ? snippetMatch[1].replace(/<[^>]*>/g, '').trim() : '';
+          if (title || snippet) results.push({ title, snippet, url });
+        }
+
+        // HTML 결과가 없으면 Instant Answer API 폴백
+        if (results.length === 0) {
+          const apiUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
+          https.get(apiUrl, (apiRes) => {
+            let apiData = '';
+            apiRes.on('data', (c) => { apiData += c; });
+            apiRes.on('end', () => {
+              try {
+                const j = JSON.parse(apiData);
+                if (j.AbstractText) results.push({ title: j.Heading || query, snippet: j.AbstractText, url: j.AbstractURL || '' });
+                (j.RelatedTopics || []).slice(0, 5).forEach(t => {
+                  if (t.Text && t.FirstURL) results.push({ title: t.Text.split(' - ')[0], snippet: t.Text, url: t.FirstURL });
+                });
+              } catch (_) { /* 무시 */ }
+              resolve({ success: true, query, results, count: results.length });
+            });
+          }).on('error', () => resolve({ success: true, query, results: [], count: 0 }));
+          return;
+        }
+        resolve({ success: true, query, results, count: results.length });
+      });
+    });
+
+    req.on('error', () => resolve({ success: true, query, results: [], count: 0 }));
+    req.on('timeout', () => { req.destroy(); resolve({ success: true, query, results: [], count: 0 }); });
+    req.write(postData);
+    req.end();
+  });
+}
+
 // ===== Bash 실행 =====
 async function executeBashCommand(command) {
   try {
@@ -457,6 +526,10 @@ const FUNCTION_TOOLS = [
   { type: 'function', function: {
     name: 'execute_command', description: '셸 명령을 실행합니다',
     parameters: { type: 'object', properties: { command: { type: 'string', description: '실행할 명령' } }, required: ['command'] },
+  }},
+  { type: 'function', function: {
+    name: 'web_search', description: '인터넷에서 최신 정보를 검색합니다. 실시간 데이터나 최신 정보가 필요할 때 사용하세요.',
+    parameters: { type: 'object', properties: { query: { type: 'string', description: '검색할 키워드 (간결하게, 1-6단어 권장)' } }, required: ['query'] },
   }},
   { type: 'function', function: {
     name: 'web_read', description: 'URL의 내용을 읽고 마크다운으로 반환합니다',
@@ -494,6 +567,14 @@ async function executeTool(toolName, args) {
     case 'execute_command':
       result = await executeBashCommand(args.command);
       break;
+    case 'web_search': {
+      try {
+        const sr = await duckDuckGoSearch(args.query);
+        const formatted = sr.results.slice(0, 5).map(r => `${r.title}\n${r.snippet}\n${r.url}`).join('\n\n');
+        result = { success: true, query: args.query, count: sr.count, results: formatted || '검색 결과 없음' };
+      } catch (e) { result = { success: false, error: e.message }; }
+      break;
+    }
     case 'web_read': {
       try {
         const res = await zaiWebRead(args.url);
@@ -715,7 +796,12 @@ async function handleSlashCommand(input, rl) {
 
     case 'search': case 's':
       if (!arg) { console.log(`  사용법: /search <검색어>\n`); break; }
-      await cmdSearch(arg);
+      await cmdSearchDDG(arg);
+      break;
+
+    case 'zsearch': case 'zs':
+      if (!arg) { console.log(`  사용법: /zsearch <검색어>  (z.ai search-prime)\n`); break; }
+      await cmdSearchZai(arg);
       break;
 
     case 'read': case 'r':
@@ -799,17 +885,33 @@ async function handleSlashCommand(input, rl) {
 }
 
 // ===== 명령어 구현 =====
-async function cmdSearch(query) {
+async function cmdSearchDDG(query) {
   try {
-    process.stdout.write(`${c.dim}검색중...${c.reset}`);
+    process.stdout.write(`${c.dim}DuckDuckGo 검색중...${c.reset}`);
+    const res = await duckDuckGoSearch(query);
+    process.stdout.write('\r\x1b[K');
+    if (!res.results.length) { console.log(`${c.yellow}검색 결과 없음${c.reset}\n`); return; }
+    console.log(`${c.bold}검색 결과: "${query}"${c.reset} (${res.count}건)\n`);
+    for (const r of res.results.slice(0, 10)) {
+      console.log(`  ${c.cyan}${r.title}${c.reset}`);
+      if (r.snippet) console.log(`  ${c.dim}${r.snippet.slice(0, 150)}${c.reset}`);
+      if (r.url) console.log(`  ${c.blue}${r.url}${c.reset}`);
+      console.log('');
+    }
+  } catch (e) { console.error(`${c.red}검색 실패: ${e.message}${c.reset}\n`); }
+}
+
+async function cmdSearchZai(query) {
+  try {
+    process.stdout.write(`${c.dim}z.ai 검색중 (search-prime)...${c.reset}`);
     const res = await zaiWebSearch(query);
     process.stdout.write('\r\x1b[K');
     const results = res.search_result || [];
     if (!results.length) { console.log(`${c.yellow}검색 결과 없음${c.reset}\n`); return; }
-    console.log(`${c.bold}검색 결과: "${query}"${c.reset} (${results.length}건)\n`);
+    console.log(`${c.bold}z.ai 검색: "${query}"${c.reset} (${results.length}건)\n`);
     for (const r of results.slice(0, 10)) {
       console.log(`  ${c.cyan}${r.title}${c.reset}`);
-      if (r.content) console.log(`  ${c.dim}${r.content.slice(0, 120)}${c.reset}`);
+      if (r.content) console.log(`  ${c.dim}${r.content.slice(0, 150)}${c.reset}`);
       if (r.link) console.log(`  ${c.blue}${r.link}${c.reset}`);
       console.log('');
     }
@@ -1177,8 +1279,9 @@ ${c.cyan}설정${c.reset}
   /config [키 값] 설정 보기/변경
   /config save    설정 파일로 저장
 
-${c.cyan}z.ai API${c.reset}
-  /search <검색어>    웹 검색 (z.ai)
+${c.cyan}z.ai API / 검색${c.reset}
+  /search <검색어>    웹 검색 (DuckDuckGo)
+  /zsearch <검색어>   웹 검색 (z.ai search-prime, 중국어 특화)
   /read <URL>         URL 읽기 (z.ai 웹 리더)
   /image <프롬프트>   이미지 생성 [--size WxH]
   /video <프롬프트>   비디오 생성 [--audio] [--duration N] [--fps N]
@@ -1297,7 +1400,7 @@ async function main() {
 
   if (cli.mode === 'oneshot') { await runOneShot(cli.question); return; }
   if (cli.mode === 'image') { await cmdImage(cli.value); return; }
-  if (cli.mode === 'search') { await cmdSearch(cli.value); return; }
+  if (cli.mode === 'search') { await cmdSearchDDG(cli.value); return; }
   if (cli.mode === 'read') { await cmdRead(cli.value); return; }
   if (cli.mode === 'ocr') { await cmdOcr(cli.value); return; }
   if (cli.mode === 'embed') { await cmdEmbed(cli.value); return; }
@@ -1331,15 +1434,16 @@ async function main() {
 - read_file: 파일 읽기 (워크스페이스 기준 상대/절대 경로)
 - write_file: 파일 쓰기 (디렉토리 자동 생성)
 - execute_command: 셸 명령 실행 (30초 타임아웃)
+- web_search: 인터넷 검색 (DuckDuckGo, 최신 정보/실시간 데이터)
 - web_read: URL 내용을 마크다운으로 읽기
 - generate_image: 텍스트로 이미지 생성
 
-필요한 경우 도구를 적극 활용하세요.
+최신 정보가 필요하면 web_search를 적극 활용하세요.
 `;
   }
 
   if (CFG.webSearch) {
-    systemPrompt += `웹 검색이 자동으로 활성화되어 있습니다. 최신 정보가 필요하면 활용됩니다.\n`;
+    systemPrompt += `z.ai 내장 웹 검색이 활성화되어 있습니다. (중국 엔진 기반, /websearch 로 토글)\n`;
   }
 
   systemPrompt += '한국어로 답변하세요.';
