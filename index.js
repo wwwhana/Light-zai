@@ -90,6 +90,7 @@ const CFG = {
 let bashMode = false;
 const conversationHistory = [];
 let lastUsage = null;
+let _rl = null; // REPL readline 인스턴스 (승인 프롬프트용)
 
 // ===== 유틸리티 =====
 function debugLog(...args) { if (CFG.debug) console.log(`${c.dim}[DEBUG]${c.reset}`, ...args); }
@@ -503,6 +504,114 @@ function duckDuckGoSearch(query) {
   });
 }
 
+// ===== 사용자 승인 프롬프트 =====
+function promptUser(question) {
+  return new Promise((resolve) => {
+    if (_rl) {
+      _rl.question(question, (answer) => resolve(answer.trim().toLowerCase()));
+    } else {
+      // REPL 외부 (원샷 모드 등) — 자동 거부
+      resolve('n');
+    }
+  });
+}
+
+// ===== 명령 디스패처 (슬래시 명령 + bash) =====
+async function dispatchCommand(cmdStr) {
+  if (!cmdStr.startsWith('/')) {
+    // Bash 명령
+    const res = await executeBashCommand(cmdStr);
+    return {
+      success: res.success,
+      type: 'bash',
+      output: truncate((res.stdout || '') + (res.stderr || ''), 10000),
+      code: res.code,
+    };
+  }
+
+  const parts = cmdStr.slice(1).split(/\s+/);
+  const cmd = parts[0].toLowerCase();
+  const arg = parts.slice(1).join(' ').trim();
+
+  switch (cmd) {
+    case 'search': case 's': {
+      const res = await duckDuckGoSearch(arg);
+      const formatted = res.results.slice(0, 5).map(r => `${r.title}\n${r.snippet}\n${r.url}`).join('\n\n');
+      return { success: true, type: 'search', query: arg, count: res.count, output: formatted || '검색 결과 없음' };
+    }
+    case 'zsearch': case 'zs': {
+      const res = await zaiWebSearch(arg);
+      const results = res.search_result || [];
+      const formatted = results.slice(0, 5).map(r => `${r.title}\n${r.content || ''}\n${r.link || ''}`).join('\n\n');
+      return { success: true, type: 'zsearch', query: arg, count: results.length, output: formatted || '검색 결과 없음' };
+    }
+    case 'read': case 'r': {
+      const res = await zaiWebRead(arg);
+      const r = res.reader_result || res;
+      // 대화 히스토리에도 추가
+      conversationHistory.push({ role: 'user', content: `[URL 읽기 결과: ${arg}]\n${truncate(r.content || '', 10000)}` });
+      return { success: true, type: 'read', title: r.title, output: truncate(r.content || '', 10000) };
+    }
+    case 'image': case 'img': {
+      let prompt = arg, size = null;
+      const sizeMatch = arg.match(/--size\s+(\S+)/);
+      if (sizeMatch) { size = sizeMatch[1]; prompt = arg.replace(/--size\s+\S+/, '').trim(); }
+      process.stdout.write(`${c.dim}  이미지 생성중...${c.reset}`);
+      const res = await zaiGenerateImage(prompt, { size });
+      process.stdout.write('\r\x1b[K');
+      const url = res.data?.[0]?.url;
+      if (url) {
+        console.log(`  ${c.green}완료${c.reset}: ${c.cyan}${url}${c.reset}`);
+        return { success: true, type: 'image', url };
+      }
+      return { success: false, error: '이미지 URL 없음' };
+    }
+    case 'video': case 'vid': {
+      process.stdout.write(`${c.dim}  비디오 생성 요청중...${c.reset}`);
+      const res = await zaiGenerateVideo(arg);
+      process.stdout.write('\r\x1b[K');
+      const taskId = res.id;
+      if (!taskId) return { success: false, error: '작업 ID 없음' };
+      console.log(`  작업 ID: ${c.cyan}${taskId}${c.reset}`);
+      const result = await zaiPollResult(taskId);
+      process.stdout.write('\r\x1b[K');
+      const videos = result.video_result || [];
+      if (videos.length) {
+        for (const v of videos) console.log(`  ${c.green}완료${c.reset}: ${c.cyan}${v.url}${c.reset}`);
+        return { success: true, type: 'video', videos: videos.map(v => v.url) };
+      }
+      return { success: false, error: '비디오 결과 없음' };
+    }
+    case 'ocr': {
+      process.stdout.write(`${c.dim}  OCR 처리중...${c.reset}`);
+      const res = await zaiLayoutParsing(arg);
+      process.stdout.write('\r\x1b[K');
+      return { success: true, type: 'ocr', output: res.md_results || '', regions: res.layout_details?.length || 0 };
+    }
+    case 'embed': {
+      const res = await zaiEmbed(arg);
+      const emb = res.data?.[0]?.embedding;
+      return { success: true, type: 'embed', dimensions: emb?.length, preview: emb?.slice(0, 5) };
+    }
+    case 'upload': {
+      process.stdout.write(`${c.dim}  업로드중...${c.reset}`);
+      const res = await zaiUploadFile(arg);
+      process.stdout.write('\r\x1b[K');
+      console.log(`  ${c.green}완료${c.reset}: ID ${c.cyan}${res.id}${c.reset}`);
+      return { success: true, type: 'upload', id: res.id, filename: res.filename };
+    }
+    case 'transcribe': case 'asr': {
+      process.stdout.write(`${c.dim}  음성 인식중...${c.reset}`);
+      const res = await zaiTranscribeAudio(arg);
+      process.stdout.write('\r\x1b[K');
+      const text = res.text || res.choices?.[0]?.message?.content || JSON.stringify(res);
+      return { success: true, type: 'transcribe', output: text };
+    }
+    default:
+      return { success: false, error: `지원하지 않는 명령: /${cmd}` };
+  }
+}
+
 // ===== Bash 실행 =====
 async function executeBashCommand(command) {
   try {
@@ -538,6 +647,14 @@ const FUNCTION_TOOLS = [
   { type: 'function', function: {
     name: 'generate_image', description: '텍스트 설명으로 이미지를 생성합니다',
     parameters: { type: 'object', properties: { prompt: { type: 'string', description: '이미지 설명' }, size: { type: 'string', description: '크기 (예: 1024x1024)', enum: ['1024x1024','768x1344','864x1152','1344x768','1152x864'] } }, required: ['prompt'] },
+  }},
+  { type: 'function', function: {
+    name: 'run_with_approval',
+    description: '사용자의 승인을 받아 슬래시 명령이나 bash 명령을 실행합니다. 이미지/비디오 생성, OCR, 음성인식, 파일 업로드, 복잡한 bash 작업 등에 사용하세요. 사용 가능한 명령: /image, /video, /ocr, /embed, /upload, /transcribe, /search, /read, 또는 bash 명령.',
+    parameters: { type: 'object', properties: {
+      description: { type: 'string', description: '실행할 작업 설명 (사용자에게 한국어로 보여줌)' },
+      command: { type: 'string', description: '실행할 명령 (예: "/image 고양이 그림", "/ocr https://url", "ffmpeg -i a.mp4 b.mp3")' },
+    }, required: ['description', 'command'] },
   }},
 ];
 
@@ -589,6 +706,22 @@ async function executeTool(toolName, args) {
         const url = res.data?.[0]?.url;
         result = url ? { success: true, url } : { success: false, error: '이미지 URL 없음' };
       } catch (e) { result = { success: false, error: e.message }; }
+      break;
+    }
+    case 'run_with_approval': {
+      console.log(`\n${c.yellow}[AI 실행 요청]${c.reset} ${args.description}`);
+      console.log(`  ${c.cyan}${args.command}${c.reset}`);
+      const answer = await promptUser(`  실행할까요? (${c.green}y${c.reset}/${c.red}n${c.reset}) `);
+      if (answer === 'y' || answer === 'yes' || answer === 'ㅛ') {
+        try {
+          result = await dispatchCommand(args.command);
+        } catch (e) {
+          result = { success: false, error: e.message };
+        }
+      } else {
+        console.log(`  ${c.dim}거부됨${c.reset}`);
+        result = { success: false, denied: true, message: '사용자가 실행을 거부했습니다' };
+      }
       break;
     }
     default:
@@ -1437,7 +1570,20 @@ async function main() {
 - web_search: 인터넷 검색 (DuckDuckGo, 최신 정보/실시간 데이터)
 - web_read: URL 내용을 마크다운으로 읽기
 - generate_image: 텍스트로 이미지 생성
+- run_with_approval: 사용자 승인 후 명령 실행 (아래 참고)
 
+run_with_approval로 실행 가능한 명령:
+  /image <프롬프트> — 이미지 생성
+  /video <프롬프트> — 비디오 생성
+  /ocr <이미지URL> — OCR 텍스트 추출
+  /embed <텍스트> — 텍스트 임베딩
+  /upload <파일경로> — 파일 업로드
+  /transcribe <오디오파일> — 음성 인식
+  /search <검색어> — 웹 검색
+  /read <URL> — URL 읽기
+  bash 명령도 가능 (예: ffmpeg, curl 등)
+
+사용자에게 부담이 되는 복잡한 명령은 run_with_approval로 대신 입력해주세요.
 최신 정보가 필요하면 web_search를 적극 활용하세요.
 `;
   }
@@ -1451,6 +1597,7 @@ async function main() {
   conversationHistory.push({ role: 'system', content: systemPrompt });
 
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  _rl = rl;
 
   function getPrompt() {
     if (bashMode) return `${c.yellow}bash${c.reset}:${path.basename(CFG.workspace)}$ `;
