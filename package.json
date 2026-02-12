@@ -9,9 +9,9 @@
   },
   "scripts": {
     "start": "node index.js",
-    "start:tools": "ENABLE_TOOLS=1 node index.js",
-    "start:full": "ENABLE_TOOLS=1 ENABLE_THINK=1 node index.js",
-    "start:debug": "DEBUG=1 ENABLE_TOOLS=1 node index.js",
+    "start:tools": "LZAI_TOOLS=1 node index.js",
+    "start:full": "LZAI_TOOLS=1 LZAI_THINK=1 node index.js",
+    "start:debug": "LZAI_DEBUG=1 LZAI_TOOLS=1 node index.js",
     "doctor": "node index.js --doctor"
   },
   "keywords": [
