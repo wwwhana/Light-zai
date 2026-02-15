@@ -327,22 +327,26 @@ function renderHud(elapsed) {
     `${c.dim}=${c.reset} ${c.bold}${tt}${c.reset}`,
   ];
   const extra = [];
-  if (sessionUsage.requests > 1) extra.push(`${c.dim}세션${c.reset} ${st}`);
   if (elStr) extra.push(`${c.dim}${elStr}${c.reset}`);
 
-  // 쿼터 진행률 (가장 사용률 높은 것 하나)
-  const quotaInfo = [];
-  for (const [key, ms] of Object.entries(QUOTA_WINDOWS)) {
-    const limit = quotaLimits[key];
-    if (!limit) continue;
-    const wu = getWindowUsage(ms);
-    quotaInfo.push({ key, used: wu.totalTokens, limit });
-  }
-  if (quotaInfo.length > 0) {
-    // 가장 사용률 높은 쿼터
-    quotaInfo.sort(function(a, b) { return (b.used / b.limit) - (a.used / a.limit); });
-    const top = quotaInfo[0];
-    extra.push(`${c.dim}${windowLabel(top.key)}${c.reset} ${quotaBar(top.used, top.limit)}`);
+  // 쿼터/구간 사용량 (항상 표시)
+  const hasAnyLimit = Object.values(quotaLimits).some(function(v) { return v > 0; });
+  if (hasAnyLimit) {
+    // 한도 설정된 구간들: 진행률 바
+    for (const [key, ms] of Object.entries(QUOTA_WINDOWS)) {
+      const limit = quotaLimits[key];
+      if (!limit) continue;
+      const wu = getWindowUsage(ms);
+      extra.push(`${c.dim}${windowLabel(key)}${c.reset} ${quotaBar(wu.totalTokens, limit)}`);
+    }
+  } else {
+    // 한도 없으면 구간 사용량만 간결히 표시
+    const w5h = getWindowUsage(QUOTA_WINDOWS['5h']);
+    const wDay = getWindowUsage(QUOTA_WINDOWS['daily']);
+    const wWeek = getWindowUsage(QUOTA_WINDOWS['weekly']);
+    extra.push(`${c.dim}5h${c.reset} ${fmtTokens(w5h.totalTokens)}`);
+    extra.push(`${c.dim}일${c.reset} ${fmtTokens(wDay.totalTokens)}`);
+    extra.push(`${c.dim}주${c.reset} ${fmtTokens(wWeek.totalTokens)}`);
   }
 
   const line = `  ${c.dim}──${c.reset} ${parts.join(` ${c.dim}+${c.reset} `)}${extra.length ? ` ${c.dim}│${c.reset} ` + extra.join(` ${c.dim}│${c.reset} `) : ''} ${c.dim}──${c.reset}`;
