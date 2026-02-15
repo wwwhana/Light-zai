@@ -23,6 +23,8 @@ const SESSIONS_DIR = path.join(CONFIG_DIR, 'sessions');
 const PRESETS_DIR = path.join(CONFIG_DIR, 'presets');
 const SKILLS_DIR = path.join(CONFIG_DIR, 'skills');
 const MCP_CONFIG_FILE = path.join(CONFIG_DIR, 'mcp.json');
+const USAGE_LOG_FILE = path.join(CONFIG_DIR, 'usage-log.json');
+const QUOTA_FILE = path.join(CONFIG_DIR, 'quota.json');
 
 // ===== ANSI 색상 =====
 const IS_TTY = process.stdout.isTTY;
@@ -195,6 +197,102 @@ function fmtTokens(n) {
   return Math.round(n / 1000) + 'K';
 }
 
+// ===== 쿼터 / 사용량 로그 시스템 =====
+const QUOTA_WINDOWS = {
+  '5h':   5 * 60 * 60 * 1000,
+  'daily': 24 * 60 * 60 * 1000,
+  'weekly': 7 * 24 * 60 * 60 * 1000,
+};
+
+// 쿼터 기본값 (0 = 제한 없음)
+const DEFAULT_QUOTA = { '5h': 0, 'daily': 0, 'weekly': 0 };
+
+function loadQuota() {
+  try {
+    if (fs.existsSync(QUOTA_FILE)) return { ...DEFAULT_QUOTA, ...JSON.parse(fs.readFileSync(QUOTA_FILE, 'utf-8')) };
+  } catch (_) {}
+  return { ...DEFAULT_QUOTA };
+}
+
+function saveQuota(q) {
+  ensureDir(CONFIG_DIR);
+  fs.writeFileSync(QUOTA_FILE, JSON.stringify(q, null, 2), 'utf-8');
+}
+
+let quotaLimits = loadQuota();
+
+// 사용량 로그: [{ ts, pt, ct, tt, model }]
+function loadUsageLog() {
+  try {
+    if (fs.existsSync(USAGE_LOG_FILE)) return JSON.parse(fs.readFileSync(USAGE_LOG_FILE, 'utf-8'));
+  } catch (_) {}
+  return [];
+}
+
+function appendUsageLog(entry) {
+  const log = loadUsageLog();
+  log.push(entry);
+  // 30일 이상 된 기록 정리
+  const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  const trimmed = log.filter(function(e) { return e.ts > cutoff; });
+  ensureDir(CONFIG_DIR);
+  fs.writeFileSync(USAGE_LOG_FILE, JSON.stringify(trimmed), 'utf-8');
+}
+
+// 특정 윈도우 내 사용량 합산
+function getWindowUsage(windowMs) {
+  const log = loadUsageLog();
+  const since = Date.now() - windowMs;
+  let pt = 0, ct = 0, tt = 0, reqs = 0;
+  for (const e of log) {
+    if (e.ts >= since) {
+      pt += e.pt || 0;
+      ct += e.ct || 0;
+      tt += e.tt || 0;
+      reqs++;
+    }
+  }
+  return { promptTokens: pt, completionTokens: ct, totalTokens: tt, requests: reqs };
+}
+
+// 쿼터 초과 확인 (0 = 제한 없음)
+function checkQuota() {
+  const warnings = [];
+  for (const [key, ms] of Object.entries(QUOTA_WINDOWS)) {
+    const limit = quotaLimits[key];
+    if (!limit) continue;
+    const usage = getWindowUsage(ms);
+    const pct = Math.round((usage.totalTokens / limit) * 100);
+    if (pct >= 100) {
+      warnings.push({ key, pct, usage: usage.totalTokens, limit, level: 'over' });
+    } else if (pct >= 80) {
+      warnings.push({ key, pct, usage: usage.totalTokens, limit, level: 'warn' });
+    }
+  }
+  return warnings;
+}
+
+// 쿼터 진행률 바 (10칸)
+function quotaBar(used, limit) {
+  if (!limit) return '';
+  const pct = Math.min(1, used / limit);
+  const filled = Math.round(pct * 10);
+  const empty = 10 - filled;
+  let color;
+  if (pct >= 1) color = c.red;
+  else if (pct >= 0.8) color = c.yellow;
+  else color = c.green;
+  return color + '█'.repeat(filled) + c.dim + '░'.repeat(empty) + c.reset + ' ' + Math.round(pct * 100) + '%';
+}
+
+// 윈도우 이름 한국어
+function windowLabel(key) {
+  if (key === '5h') return '5시간';
+  if (key === 'daily') return '일간';
+  if (key === 'weekly') return '주간';
+  return key;
+}
+
 // 사용량 누적
 function trackUsage(usage) {
   if (!usage) return;
@@ -203,6 +301,14 @@ function trackUsage(usage) {
   sessionUsage.promptTokens += usage.prompt_tokens || 0;
   sessionUsage.completionTokens += usage.completion_tokens || 0;
   sessionUsage.totalTokens += usage.total_tokens || 0;
+  // 디스크 로그 기록
+  appendUsageLog({
+    ts: Date.now(),
+    pt: usage.prompt_tokens || 0,
+    ct: usage.completion_tokens || 0,
+    tt: usage.total_tokens || 0,
+    model: CFG.model,
+  });
 }
 
 // 사용량 HUD 렌더링
@@ -214,7 +320,7 @@ function renderHud(elapsed) {
   const tt = fmtTokens(u.total_tokens);
   const st = fmtTokens(sessionUsage.totalTokens);
   const elStr = elapsed ? (elapsed / 1000).toFixed(1) + '초' : '';
-  // ─── 토큰: 입력 1.2K + 출력 345 = 1.5K │ 세션 12.3K │ 2.1초 ───
+
   const parts = [
     `${c.dim}입력${c.reset} ${pt}`,
     `${c.dim}출력${c.reset} ${ct}`,
@@ -223,8 +329,34 @@ function renderHud(elapsed) {
   const extra = [];
   if (sessionUsage.requests > 1) extra.push(`${c.dim}세션${c.reset} ${st}`);
   if (elStr) extra.push(`${c.dim}${elStr}${c.reset}`);
+
+  // 쿼터 진행률 (가장 사용률 높은 것 하나)
+  const quotaInfo = [];
+  for (const [key, ms] of Object.entries(QUOTA_WINDOWS)) {
+    const limit = quotaLimits[key];
+    if (!limit) continue;
+    const wu = getWindowUsage(ms);
+    quotaInfo.push({ key, used: wu.totalTokens, limit });
+  }
+  if (quotaInfo.length > 0) {
+    // 가장 사용률 높은 쿼터
+    quotaInfo.sort(function(a, b) { return (b.used / b.limit) - (a.used / a.limit); });
+    const top = quotaInfo[0];
+    extra.push(`${c.dim}${windowLabel(top.key)}${c.reset} ${quotaBar(top.used, top.limit)}`);
+  }
+
   const line = `  ${c.dim}──${c.reset} ${parts.join(` ${c.dim}+${c.reset} `)}${extra.length ? ` ${c.dim}│${c.reset} ` + extra.join(` ${c.dim}│${c.reset} `) : ''} ${c.dim}──${c.reset}`;
   console.log(line);
+
+  // 쿼터 경고
+  const warnings = checkQuota();
+  for (const w of warnings) {
+    if (w.level === 'over') {
+      console.log(`  ${c.bgRed}${c.bold} ⚠ ${windowLabel(w.key)} 쿼터 초과 ${c.reset} ${fmtTokens(w.usage)} / ${fmtTokens(w.limit)} (${w.pct}%)`);
+    } else if (w.level === 'warn') {
+      console.log(`  ${c.yellow}⚠ ${windowLabel(w.key)} 쿼터 ${w.pct}%${c.reset} ${c.dim}(${fmtTokens(w.usage)} / ${fmtTokens(w.limit)})${c.reset}`);
+    }
+  }
 }
 
 function getMimeType(ext) {
@@ -1722,17 +1854,27 @@ async function handleSlashCommand(input, rl) {
 
     case 'usage': {
       const su = sessionUsage;
-      console.log(`\n  ${c.bold}세션 사용량${c.reset}`);
-      console.log(`  ${c.dim}${'─'.repeat(35)}${c.reset}`);
-      console.log(`  요청 횟수     ${c.bold}${su.requests}${c.reset}회`);
-      console.log(`  입력 토큰     ${fmtTokens(su.promptTokens)}`);
-      console.log(`  출력 토큰     ${fmtTokens(su.completionTokens)}`);
-      console.log(`  합계 토큰     ${c.bold}${fmtTokens(su.totalTokens)}${c.reset}`);
+      console.log(`\n  ${c.bold}사용량${c.reset}`);
+      console.log(`  ${c.dim}${'─'.repeat(42)}${c.reset}`);
+      console.log(`  ${c.cyan}◆ 현재 세션${c.reset}`);
+      console.log(`    요청 ${c.bold}${su.requests}${c.reset}회  |  입력 ${fmtTokens(su.promptTokens)}  출력 ${fmtTokens(su.completionTokens)}  합계 ${c.bold}${fmtTokens(su.totalTokens)}${c.reset}`);
       if (lastUsage) {
-        console.log(`  ${c.dim}${'─'.repeat(35)}${c.reset}`);
-        console.log(`  ${c.dim}마지막 요청: 입력 ${fmtTokens(lastUsage.prompt_tokens)} + 출력 ${fmtTokens(lastUsage.completion_tokens)} = ${fmtTokens(lastUsage.total_tokens)}${c.reset}`);
+        console.log(`    ${c.dim}마지막: 입력 ${fmtTokens(lastUsage.prompt_tokens)} + 출력 ${fmtTokens(lastUsage.completion_tokens)} = ${fmtTokens(lastUsage.total_tokens)}${c.reset}`);
       }
       console.log('');
+      console.log(`  ${c.cyan}◆ 구간별 사용량${c.reset}`);
+      for (const [key, ms] of Object.entries(QUOTA_WINDOWS)) {
+        const wu = getWindowUsage(ms);
+        const limit = quotaLimits[key];
+        const bar = limit ? '  ' + quotaBar(wu.totalTokens, limit) : '';
+        console.log(`    ${windowLabel(key).padEnd(6)} ${c.bold}${fmtTokens(wu.totalTokens).padStart(6)}${c.reset} 토큰  ${c.dim}(${wu.requests}회)${c.reset}${bar}`);
+      }
+      console.log('');
+      break;
+    }
+
+    case 'quota': {
+      await cmdQuota(arg);
       break;
     }
 
@@ -2155,6 +2297,75 @@ function cmdPop() {
     removed++;
   }
   console.log(`${c.green}마지막 대화 쌍 제거 (${removed}개)${c.reset}\n`);
+}
+
+// ===== 쿼터 명령어 =====
+async function cmdQuota(arg) {
+  const parts = arg ? arg.split(/\s+/) : [];
+  const sub = parts[0] || '';
+
+  switch (sub) {
+    case '':
+    case 'show': {
+      console.log(`\n  ${c.bold}쿼터 설정${c.reset}`);
+      console.log(`  ${c.dim}${'─'.repeat(42)}${c.reset}`);
+      for (const [key, ms] of Object.entries(QUOTA_WINDOWS)) {
+        const limit = quotaLimits[key];
+        const wu = getWindowUsage(ms);
+        if (limit) {
+          console.log(`  ${windowLabel(key).padEnd(6)} ${quotaBar(wu.totalTokens, limit)}  ${c.dim}(${fmtTokens(wu.totalTokens)} / ${fmtTokens(limit)})${c.reset}`);
+        } else {
+          console.log(`  ${windowLabel(key).padEnd(6)} ${c.dim}제한 없음${c.reset}  ${c.dim}(현재 ${fmtTokens(wu.totalTokens)})${c.reset}`);
+        }
+      }
+      console.log(`\n  ${c.dim}설정: /quota set <5h|daily|weekly> <토큰수>${c.reset}`);
+      console.log(`  ${c.dim}해제: /quota off <5h|daily|weekly>${c.reset}`);
+      console.log(`  ${c.dim}초기화: /quota reset${c.reset}\n`);
+      break;
+    }
+    case 'set': {
+      const key = parts[1];
+      const val = parts[2];
+      if (!key || !val || !QUOTA_WINDOWS[key]) {
+        console.log(`  ${c.yellow}사용법: /quota set <5h|daily|weekly> <토큰수>${c.reset}`);
+        console.log(`  ${c.dim}예: /quota set 5h 100000  (5시간 10만 토큰)${c.reset}`);
+        console.log(`  ${c.dim}    /quota set weekly 1000000  (주간 100만 토큰)${c.reset}\n`);
+        break;
+      }
+      let num = parseInt(val);
+      // K/M 단위 지원
+      if (val.toLowerCase().endsWith('k')) num = parseInt(val) * 1000;
+      else if (val.toLowerCase().endsWith('m')) num = parseInt(val) * 1000000;
+      if (isNaN(num) || num <= 0) {
+        console.log(`  ${c.red}✗${c.reset} 유효한 숫자를 입력하세요\n`);
+        break;
+      }
+      quotaLimits[key] = num;
+      saveQuota(quotaLimits);
+      console.log(`  ${c.green}✓${c.reset} ${windowLabel(key)} 쿼터: ${c.bold}${fmtTokens(num)}${c.reset} 토큰\n`);
+      break;
+    }
+    case 'off': case 'clear': {
+      const key = parts[1];
+      if (!key || !QUOTA_WINDOWS[key]) {
+        console.log(`  ${c.yellow}사용법: /quota off <5h|daily|weekly>${c.reset}\n`);
+        break;
+      }
+      quotaLimits[key] = 0;
+      saveQuota(quotaLimits);
+      console.log(`  ${c.green}✓${c.reset} ${windowLabel(key)} 쿼터 해제\n`);
+      break;
+    }
+    case 'reset': {
+      // 사용량 로그 초기화
+      ensureDir(CONFIG_DIR);
+      fs.writeFileSync(USAGE_LOG_FILE, '[]', 'utf-8');
+      console.log(`  ${c.green}✓${c.reset} 사용량 로그 초기화\n`);
+      break;
+    }
+    default:
+      console.log(`  사용법: /quota [show|set|off|reset]\n`);
+  }
 }
 
 async function cmdDoctor() {
@@ -2609,7 +2820,8 @@ function printHelp() {
     /websearch      웹 검색 토글
     /json           JSON 모드 토글
     /hud            사용량 HUD 토글
-    /usage          세션 사용량 상세
+    /usage          사용량 상세 (세션 + 구간별)
+    /quota          쿼터 설정 (5h/daily/weekly)
     /config [키 값] 설정 보기/변경
     /config save    설정 파일로 저장
 
