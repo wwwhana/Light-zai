@@ -114,6 +114,7 @@ let mcpServers = {}; // { name: { url, tools: [...], sessionId } }
 let activePreset = null; // { name, content }
 let hudEnabled = true; // 사용량 HUD 표시 여부
 const sessionUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0, requests: 0 };
+let apiAccountInfo = null; // API 계정 정보 (헤더 또는 엔드포인트에서 추출)
 
 // ===== 유틸리티 =====
 function debugLog(...args) { if (CFG.debug) console.log(`${c.dim}[DEBUG]${c.reset}`, ...args); }
@@ -527,6 +528,16 @@ function renderHud(elapsed) {
     extra.push(`${c.dim}주${c.reset} ${fmtTokens(wWeek.totalTokens)}`);
   }
 
+  // API 계정 정보 (rate-limit / 잔액)
+  if (apiAccountInfo) {
+    const rem = apiAccountInfo['x-ratelimit-remaining-tokens'] || apiAccountInfo['x-token-remaining'] || apiAccountInfo['ratelimit-remaining'];
+    const lim = apiAccountInfo['x-ratelimit-limit-tokens'] || apiAccountInfo['x-token-limit'] || apiAccountInfo['ratelimit-limit'];
+    const bal = apiAccountInfo['x-balance'] || apiAccountInfo['x-credits'] || apiAccountInfo['x-remaining-credits'] || apiAccountInfo['x-account-balance'];
+    if (rem && lim) extra.push(`${c.dim}RPM${c.reset} ${fmtTokens(Number(rem))}/${fmtTokens(Number(lim))}`);
+    else if (rem) extra.push(`${c.dim}잔여${c.reset} ${fmtTokens(Number(rem))}`);
+    if (bal) extra.push(`${c.dim}잔액${c.reset} ${bal}`);
+  }
+
   const line = `  ${c.dim}──${c.reset} ${parts.join(` ${c.dim}+${c.reset} `)}${extra.length ? ` ${c.dim}│${c.reset} ` + extra.join(` ${c.dim}│${c.reset} `) : ''} ${c.dim}──${c.reset}`;
   console.log(line);
 
@@ -561,6 +572,8 @@ function httpRequest(options, body) {
       res.on('end', () => {
         debugLog(`HTTP ${res.statusCode} ${options.path}`);
         if (data) debugLog('응답:', truncate(data, 500));
+        // API 계정 정보 헤더 캡처
+        captureApiHeaders(res.headers);
         try {
           const json = JSON.parse(data);
           if (res.statusCode >= 400) {
@@ -586,6 +599,8 @@ function httpStream(options, body, callbacks) {
     const { onToken, onReasoning, onToolCall, onSearchResult, onDone, onUsage } = callbacks;
     const proto = options.protocol === 'http:' ? http : https;
     const req = proto.request(options, (res) => {
+      // API 계정 정보 헤더 캡처
+      captureApiHeaders(res.headers);
       if (res.statusCode >= 400) {
         let data = '';
         res.on('data', (chunk) => { data += chunk; });
@@ -679,6 +694,67 @@ function buildMultipart(fields, files) {
   }
   chunks.push(Buffer.from(`--${boundary}--\r\n`));
   return { contentType: `multipart/form-data; boundary=${boundary}`, body: Buffer.concat(chunks) };
+}
+
+// ===== API 계정 정보 (헤더에서 추출) =====
+// 알려진 rate-limit / balance 헤더 키
+const ACCOUNT_HEADER_KEYS = [
+  'x-ratelimit-limit-requests', 'x-ratelimit-limit-tokens',
+  'x-ratelimit-remaining-requests', 'x-ratelimit-remaining-tokens',
+  'x-ratelimit-reset-requests', 'x-ratelimit-reset-tokens',
+  'x-request-limit', 'x-request-remaining',
+  'x-token-limit', 'x-token-remaining',
+  'x-balance', 'x-credits', 'x-remaining-credits',
+  'x-quota-limit', 'x-quota-remaining', 'x-quota-used',
+  'x-account-balance', 'x-monthly-usage', 'x-daily-usage',
+  'retry-after', 'ratelimit-limit', 'ratelimit-remaining', 'ratelimit-reset',
+];
+
+function captureApiHeaders(headers) {
+  if (!headers) return;
+  const info = {};
+  let found = false;
+  for (const key of ACCOUNT_HEADER_KEYS) {
+    if (headers[key] !== undefined) {
+      info[key] = headers[key];
+      found = true;
+    }
+  }
+  // 모든 x-ratelimit- 계열 헤더 캡처
+  for (const key of Object.keys(headers)) {
+    if ((key.startsWith('x-ratelimit') || key.startsWith('x-quota') || key.startsWith('x-balance') || key.startsWith('x-credit')) && !info[key]) {
+      info[key] = headers[key];
+      found = true;
+    }
+  }
+  if (found) {
+    apiAccountInfo = info;
+    debugLog('API 계정 헤더:', JSON.stringify(info));
+  }
+}
+
+// 비공식 사용량 엔드포인트 탐색
+async function fetchApiUsage() {
+  const paths = [
+    CFG.apiPrefix + '/usage',
+    CFG.apiPrefix + '/billing/usage',
+    CFG.apiPrefix + '/dashboard/billing/usage',
+    CFG.apiPrefix + '/account',
+    CFG.apiPrefix + '/quota',
+    '/api/paas/v4/usage',
+    '/api/user/usage',
+  ];
+  for (const p of paths) {
+    try {
+      debugLog('사용량 조회 시도:', p);
+      const res = await apiGet(p);
+      if (res && typeof res === 'object') {
+        debugLog('사용량 응답:', JSON.stringify(res).slice(0, 500));
+        return { path: p, data: res };
+      }
+    } catch (_) { /* 무시 */ }
+  }
+  return null;
 }
 
 // ===== API 요청 헬퍼 =====
@@ -2060,6 +2136,11 @@ async function handleSlashCommand(input, rl) {
       break;
     }
 
+    case 'account': case 'acc': {
+      await cmdAccount();
+      break;
+    }
+
     case 'search': case 's':
       if (!arg) { console.log(`  사용법: /search <검색어>\n`); break; }
       await cmdSearchDDG(arg);
@@ -2550,6 +2631,70 @@ async function cmdQuota(arg) {
   }
 }
 
+async function cmdAccount() {
+  console.log(`\n  ${c.bold}API 계정 정보${c.reset}`);
+  console.log(`  ${c.dim}${'─'.repeat(42)}${c.reset}`);
+  console.log(`  ${c.dim}서버${c.reset}  ${CFG.baseUrl}`);
+  console.log(`  ${c.dim}모델${c.reset}  ${c.cyan}${CFG.model}${c.reset}\n`);
+
+  // 1. 캡처된 응답 헤더 정보
+  if (apiAccountInfo && Object.keys(apiAccountInfo).length > 0) {
+    console.log(`  ${c.cyan}◆ 응답 헤더 (마지막 API 호출)${c.reset}`);
+    for (const [key, val] of Object.entries(apiAccountInfo)) {
+      const label = key.replace(/^x-/, '').replace(/-/g, ' ');
+      console.log(`    ${c.dim}${label.padEnd(30)}${c.reset} ${val}`);
+    }
+    console.log('');
+  } else {
+    console.log(`  ${c.dim}응답 헤더에 rate-limit/잔액 정보 없음${c.reset}`);
+    console.log(`  ${c.dim}(AI에게 질문하면 헤더가 캡처됩니다)${c.reset}\n`);
+  }
+
+  // 2. 비공식 엔드포인트 탐색
+  const spinner = createSpinner('사용량 엔드포인트 탐색').start();
+  const result = await fetchApiUsage();
+  if (result) {
+    spinner.succeed(`엔드포인트 발견: ${result.path}`);
+    console.log('');
+    const data = result.data;
+    if (typeof data === 'object') {
+      // 잘 알려진 필드들 우선 표시
+      const knownKeys = ['balance', 'credits', 'remaining', 'usage', 'total_usage', 'used', 'quota', 'plan', 'subscription', 'tokens_used', 'tokens_remaining'];
+      const shown = new Set();
+      for (const k of knownKeys) {
+        if (data[k] !== undefined) {
+          const val = typeof data[k] === 'object' ? JSON.stringify(data[k]) : data[k];
+          console.log(`    ${c.bold}${k}${c.reset}: ${val}`);
+          shown.add(k);
+        }
+      }
+      // 나머지 필드
+      for (const [k, v] of Object.entries(data)) {
+        if (shown.has(k)) continue;
+        const val = typeof v === 'object' ? JSON.stringify(v) : v;
+        console.log(`    ${c.dim}${k}${c.reset}: ${val}`);
+      }
+    } else {
+      console.log(`    ${data}`);
+    }
+    console.log('');
+  } else {
+    spinner.fail('공개 사용량 API 없음');
+    console.log(`  ${c.dim}이 API 제공자는 프로그래밍 방식의 사용량 조회를 지원하지 않습니다.${c.reset}`);
+    console.log(`  ${c.dim}대시보드에서 확인하세요: https://z.ai/manage-apikey/billing${c.reset}\n`);
+  }
+
+  // 3. 로컬 세션 사용량 요약
+  console.log(`  ${c.cyan}◆ 로컬 사용량 추적${c.reset}`);
+  const su = sessionUsage;
+  console.log(`    세션: ${c.bold}${fmtTokens(su.totalTokens)}${c.reset} 토큰 (${su.requests}회)`);
+  for (const [key, ms] of Object.entries(QUOTA_WINDOWS)) {
+    const wu = getWindowUsage(ms);
+    console.log(`    ${windowLabel(key).padEnd(6)} ${c.bold}${fmtTokens(wu.totalTokens).padStart(6)}${c.reset} 토큰 (${wu.requests}회)`);
+  }
+  console.log('');
+}
+
 async function cmdDoctor() {
   console.log(`\n  ${c.bold}시스템 진단${c.reset}`);
   console.log(`  ${c.dim}${'─'.repeat(40)}${c.reset}\n`);
@@ -3004,6 +3149,7 @@ function printHelp() {
     /hud            사용량 HUD 토글
     /usage          사용량 상세 (세션 + 구간별)
     /quota          쿼터 설정 (5h/daily/weekly)
+    /account        API 계정 정보 (헤더/잔액/사용량)
     /config [키 값] 설정 보기/변경
     /config save    설정 파일로 저장
 
