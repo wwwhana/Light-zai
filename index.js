@@ -110,6 +110,8 @@ let lastUsage = null;
 let _rl = null; // REPL readline 인스턴스 (승인 프롬프트용)
 let mcpServers = {}; // { name: { url, tools: [...], sessionId } }
 let activePreset = null; // { name, content }
+let hudEnabled = true; // 사용량 HUD 표시 여부
+const sessionUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0, requests: 0 };
 
 // ===== 유틸리티 =====
 function debugLog(...args) { if (CFG.debug) console.log(`${c.dim}[DEBUG]${c.reset}`, ...args); }
@@ -183,6 +185,46 @@ function drawBox(content, options) {
 // 상태 표시 (ON/OFF)
 function onoff(val) {
   return val ? c.green + '● ON' + c.reset : c.dim + '○ OFF' + c.reset;
+}
+
+// 토큰 수 간결 표시 (1234 → 1.2K)
+function fmtTokens(n) {
+  if (!n && n !== 0) return '?';
+  if (n < 1000) return String(n);
+  if (n < 10000) return (n / 1000).toFixed(1) + 'K';
+  return Math.round(n / 1000) + 'K';
+}
+
+// 사용량 누적
+function trackUsage(usage) {
+  if (!usage) return;
+  lastUsage = usage;
+  sessionUsage.requests++;
+  sessionUsage.promptTokens += usage.prompt_tokens || 0;
+  sessionUsage.completionTokens += usage.completion_tokens || 0;
+  sessionUsage.totalTokens += usage.total_tokens || 0;
+}
+
+// 사용량 HUD 렌더링
+function renderHud(elapsed) {
+  if (!hudEnabled || !IS_TTY || !lastUsage) return;
+  const u = lastUsage;
+  const pt = fmtTokens(u.prompt_tokens);
+  const ct = fmtTokens(u.completion_tokens);
+  const tt = fmtTokens(u.total_tokens);
+  const st = fmtTokens(sessionUsage.totalTokens);
+  const elStr = elapsed ? (elapsed / 1000).toFixed(1) + '초' : '';
+  // ─── 토큰: 입력 1.2K + 출력 345 = 1.5K │ 세션 12.3K │ 2.1초 ───
+  const parts = [
+    `${c.dim}입력${c.reset} ${pt}`,
+    `${c.dim}출력${c.reset} ${ct}`,
+    `${c.dim}=${c.reset} ${c.bold}${tt}${c.reset}`,
+  ];
+  const extra = [];
+  if (sessionUsage.requests > 1) extra.push(`${c.dim}세션${c.reset} ${st}`);
+  if (elStr) extra.push(`${c.dim}${elStr}${c.reset}`);
+  const line = `  ${c.dim}──${c.reset} ${parts.join(` ${c.dim}+${c.reset} `)}${extra.length ? ` ${c.dim}│${c.reset} ` + extra.join(` ${c.dim}│${c.reset} `) : ''} ${c.dim}──${c.reset}`;
+  console.log(line);
 }
 
 function getMimeType(ext) {
@@ -384,7 +426,7 @@ async function zaiChat(messages, options = {}) {
   if (options.stop) payload.stop = options.stop;
 
   const res = await apiPost(CFG.apiPrefix + '/chat/completions', payload);
-  if (res.usage) lastUsage = res.usage;
+  if (res.usage) trackUsage(res.usage);
   return res;
 }
 
@@ -1525,6 +1567,7 @@ async function sendMessageSync(startTime) {
   const reasoning = msg?.reasoning_content || '';
   if (reasoning) console.log(`\n  ${c.dim}${c.italic}◇ ${reasoning}${c.reset}\n`);
   conversationHistory.push({ role: 'assistant', content });
+  renderHud(Date.now() - startTime);
   debugLog(`응답 시간: ${((Date.now()-startTime)/1000).toFixed(2)}초`);
   return content;
 }
@@ -1544,7 +1587,7 @@ async function sendMessageStream(startTime) {
       process.stdout.write(token);
     },
     onSearchResult(results) { printSearchResults(results); },
-    onUsage(u) { lastUsage = u; },
+    onUsage(u) { trackUsage(u); },
   });
 
   if (isReasoning) process.stdout.write(c.reset);
@@ -1577,13 +1620,14 @@ async function sendMessageStream(startTime) {
         process.stdout.write(token);
       },
       onSearchResult(results) { printSearchResults(results); },
-      onUsage(u) { lastUsage = u; },
+      onUsage(u) { trackUsage(u); },
     });
     if (isReasoning) process.stdout.write(c.reset);
     if (!isFirstToken) process.stdout.write('\n');
   }
 
   conversationHistory.push({ role: 'assistant', content: current.content || '' });
+  renderHud(Date.now() - startTime);
   debugLog(`응답 시간: ${((Date.now()-startTime)/1000).toFixed(2)}초`);
   return current.content;
 }
@@ -1669,6 +1713,28 @@ async function handleSlashCommand(input, rl) {
       CFG.jsonMode = !CFG.jsonMode;
       console.log(`  JSON 모드 ${onoff(CFG.jsonMode)}\n`);
       break;
+
+    case 'hud':
+      hudEnabled = !hudEnabled;
+      console.log(`  사용량 HUD ${onoff(hudEnabled)}\n`);
+      if (hudEnabled && lastUsage) renderHud();
+      break;
+
+    case 'usage': {
+      const su = sessionUsage;
+      console.log(`\n  ${c.bold}세션 사용량${c.reset}`);
+      console.log(`  ${c.dim}${'─'.repeat(35)}${c.reset}`);
+      console.log(`  요청 횟수     ${c.bold}${su.requests}${c.reset}회`);
+      console.log(`  입력 토큰     ${fmtTokens(su.promptTokens)}`);
+      console.log(`  출력 토큰     ${fmtTokens(su.completionTokens)}`);
+      console.log(`  합계 토큰     ${c.bold}${fmtTokens(su.totalTokens)}${c.reset}`);
+      if (lastUsage) {
+        console.log(`  ${c.dim}${'─'.repeat(35)}${c.reset}`);
+        console.log(`  ${c.dim}마지막 요청: 입력 ${fmtTokens(lastUsage.prompt_tokens)} + 출력 ${fmtTokens(lastUsage.completion_tokens)} = ${fmtTokens(lastUsage.total_tokens)}${c.reset}`);
+      }
+      console.log('');
+      break;
+    }
 
     case 'search': case 's':
       if (!arg) { console.log(`  사용법: /search <검색어>\n`); break; }
@@ -2542,6 +2608,8 @@ function printHelp() {
     /tools          도구 호출 토글
     /websearch      웹 검색 토글
     /json           JSON 모드 토글
+    /hud            사용량 HUD 토글
+    /usage          세션 사용량 상세
     /config [키 값] 설정 보기/변경
     /config save    설정 파일로 저장
 
@@ -2602,11 +2670,12 @@ function printStatus() {
     '',
     `${c.dim}스트리밍${c.reset}   ${onoff(CFG.stream)}     ${c.dim}사고${c.reset}   ${onoff(CFG.think)}`,
     `${c.dim}도구${c.reset}       ${onoff(CFG.tools)}     ${c.dim}검색${c.reset}   ${onoff(CFG.webSearch)}`,
-    `${c.dim}JSON${c.reset}       ${onoff(CFG.jsonMode)}`,
+    `${c.dim}JSON${c.reset}       ${onoff(CFG.jsonMode)}     ${c.dim}HUD${c.reset}    ${onoff(hudEnabled)}`,
     '',
     `${c.dim}프리셋${c.reset}     ${activePreset ? c.green + activePreset.name + c.reset : c.dim + 'OFF' + c.reset}`,
     `${c.dim}MCP${c.reset}        ${mcpInfo}`,
     `${c.dim}토큰${c.reset}       ${tokenInfo}`,
+    `${c.dim}세션 합계${c.reset}  ${sessionUsage.requests}회 / ${c.bold}${fmtTokens(sessionUsage.totalTokens)}${c.reset} 토큰`,
     `${c.dim}디렉토리${c.reset}   ${CFG.workspace}`,
   ];
   console.log('\n' + drawBox(content, { title: `${c.bold}현재 상태${c.reset}`, color: c.cyan }) + '\n');
@@ -2741,7 +2810,8 @@ async function main() {
 
   function getPrompt() {
     if (bashMode) return `${c.yellow}bash${c.reset} ${c.dim}${path.basename(CFG.workspace)}${c.reset} ${c.yellow}▸${c.reset} `;
-    return `${c.cyan}사용자${c.reset} ${c.cyan}▸${c.reset} `;
+    const usage = hudEnabled && sessionUsage.totalTokens > 0 ? `${c.dim}[${fmtTokens(sessionUsage.totalTokens)}]${c.reset} ` : '';
+    return `${usage}${c.cyan}사용자${c.reset} ${c.cyan}▸${c.reset} `;
   }
 
   function prompt() { rl.setPrompt(getPrompt()); rl.prompt(); }
