@@ -189,6 +189,184 @@ function onoff(val) {
   return val ? c.green + '● ON' + c.reset : c.dim + '○ OFF' + c.reset;
 }
 
+// ===== 스크롤 시스템 (Shift+Up/Down) =====
+const scrollState = {
+  lines: [],       // 캡처된 출력 라인들
+  active: false,   // 스크롤 모드 활성
+  offset: 0,       // 현재 스크롤 위치 (하단 기준 오프셋)
+  maxLines: 5000,  // 최대 보관 라인 수
+};
+
+let _origStdoutWrite = null;
+
+// stdout 출력 캡처 시작
+function initOutputCapture() {
+  if (!IS_TTY || _origStdoutWrite) return;
+  _origStdoutWrite = process.stdout.write.bind(process.stdout);
+
+  process.stdout.write = function(chunk, encoding, callback) {
+    // 스크롤 모드 중에는 캡처하지 않음 (렌더링 출력)
+    if (!scrollState.active) {
+      const str = typeof chunk === 'string' ? chunk : chunk.toString(encoding || 'utf-8');
+      // \r로 시작하면 현재 줄 덮어쓰기 (스피너 등) - 마지막 줄 교체
+      if (str.startsWith('\r') || str.startsWith('\x1b[K')) {
+        // 스피너 업데이트는 무시 (불필요한 중간 프레임)
+      } else {
+        // 줄바꿈으로 분할하여 저장
+        const parts = str.split('\n');
+        for (let i = 0; i < parts.length; i++) {
+          if (i === 0 && scrollState.lines.length > 0) {
+            // 첫 부분은 이전 줄에 이어붙이기
+            scrollState.lines[scrollState.lines.length - 1] += parts[i];
+          } else {
+            scrollState.lines.push(parts[i]);
+          }
+        }
+        // 최대 라인 수 제한
+        if (scrollState.lines.length > scrollState.maxLines) {
+          scrollState.lines = scrollState.lines.slice(-scrollState.maxLines);
+        }
+      }
+    }
+    return _origStdoutWrite(chunk, encoding, callback);
+  };
+}
+
+// 스크롤 뷰 렌더링 (대체 화면 버퍼)
+function renderScrollView() {
+  const rows = process.stdout.rows || 24;
+  const cols = process.stdout.columns || 80;
+  const totalLines = scrollState.lines.length;
+  const viewHeight = rows - 1; // 상태바 1줄 제외
+
+  // 표시할 영역 계산
+  const endIdx = Math.max(0, totalLines - scrollState.offset);
+  const startIdx = Math.max(0, endIdx - viewHeight);
+
+  // 화면 클리어 + 커서 홈
+  let out = '\x1b[2J\x1b[H';
+
+  // 출력 라인 표시
+  const visibleLines = scrollState.lines.slice(startIdx, endIdx);
+  for (let i = 0; i < viewHeight; i++) {
+    if (i < visibleLines.length) {
+      // 화면 폭 초과 시 잘라내기 (ANSI 고려)
+      const line = visibleLines[i];
+      out += line;
+    }
+    out += '\n';
+  }
+
+  // 상태바 (하단)
+  const pct = totalLines > 0 ? Math.round(((endIdx) / totalLines) * 100) : 100;
+  const pos = `${endIdx}/${totalLines} (${pct}%)`;
+  const keys = '↑↓:1줄  PgUp/Dn:페이지  Home/End  ESC:닫기';
+  const barText = ` 스크롤  ${pos}  │  ${keys} `;
+  const padLen = Math.max(0, cols - stripAnsi(barText).length);
+  out += `\x1b[7m${barText}${' '.repeat(padLen)}\x1b[0m`;
+
+  _origStdoutWrite(out);
+}
+
+// 스크롤 모드 진입
+function enterScrollMode() {
+  if (!IS_TTY || scrollState.active) return;
+  if (scrollState.lines.length === 0) return;
+
+  scrollState.active = true;
+  scrollState.offset = 0;
+
+  // 대체 화면 버퍼 진입 + 커서 숨기기
+  _origStdoutWrite('\x1b[?1049h\x1b[?25l');
+  renderScrollView();
+}
+
+// 스크롤 모드 종료
+function exitScrollMode() {
+  if (!scrollState.active) return;
+  scrollState.active = false;
+
+  // 대체 화면 버퍼 종료 + 커서 표시
+  _origStdoutWrite('\x1b[?1049l\x1b[?25h');
+
+  // readline 프롬프트 다시 표시
+  if (_rl) { _rl.prompt(true); }
+}
+
+// 스크롤 키 입력 처리
+function handleScrollKey(key) {
+  const rows = process.stdout.rows || 24;
+  const viewHeight = rows - 1;
+  const maxOffset = Math.max(0, scrollState.lines.length - viewHeight);
+
+  switch (key) {
+    case 'up':
+      scrollState.offset = Math.min(maxOffset, scrollState.offset + 1);
+      break;
+    case 'down':
+      scrollState.offset = Math.max(0, scrollState.offset - 1);
+      break;
+    case 'pageup':
+      scrollState.offset = Math.min(maxOffset, scrollState.offset + viewHeight);
+      break;
+    case 'pagedown':
+      scrollState.offset = Math.max(0, scrollState.offset - viewHeight);
+      break;
+    case 'home':
+      scrollState.offset = maxOffset;
+      break;
+    case 'end':
+      scrollState.offset = 0;
+      break;
+    case 'escape': case 'q':
+      exitScrollMode();
+      return;
+  }
+  renderScrollView();
+}
+
+// 키프레스 인터셉터 설치 (readline 전에 키 가로채기)
+function installScrollKeyHandler() {
+  if (!IS_TTY) return;
+
+  // stdin의 keypress 이벤트를 직접 감시
+  const origEmit = process.stdin.emit.bind(process.stdin);
+  process.stdin.emit = function(event, key, meta) {
+    // keypress 이벤트 인터셉트
+    if (event === 'keypress') {
+      const k = meta || key;
+      if (k) {
+        // 스크롤 모드 중 키 처리
+        if (scrollState.active) {
+          if (k.name === 'pageup') { handleScrollKey('pageup'); return false; }
+          if (k.name === 'pagedown') { handleScrollKey('pagedown'); return false; }
+          if (k.name === 'up' && k.ctrl) { handleScrollKey('pageup'); return false; }
+          if (k.name === 'down' && k.ctrl) { handleScrollKey('pagedown'); return false; }
+          if (k.name === 'up') { handleScrollKey('up'); return false; }
+          if (k.name === 'down') { handleScrollKey('down'); return false; }
+          if (k.name === 'home') { handleScrollKey('home'); return false; }
+          if (k.name === 'end') { handleScrollKey('end'); return false; }
+          if (k.name === 'escape' || (k.name === 'q' && !k.ctrl && !k.meta)) { handleScrollKey('escape'); return false; }
+          // 스크롤 모드에서는 다른 키 입력 차단
+          return false;
+        }
+
+        // Shift+Up: 스크롤 모드 진입
+        if (k.name === 'up' && k.shift && !k.ctrl && !k.meta) {
+          enterScrollMode();
+          return false;
+        }
+        // Shift+Down 도 동일
+        if (k.name === 'down' && k.shift && !k.ctrl && !k.meta) {
+          enterScrollMode();
+          return false;
+        }
+      }
+    }
+    return origEmit.apply(process.stdin, arguments);
+  };
+}
+
 // 토큰 수 간결 표시 (1234 → 1.2K)
 function fmtTokens(n) {
   if (!n && n !== 0) return '?';
@@ -2867,6 +3045,10 @@ function printHelp() {
     /doctor   시스템 진단    /status   현재 상태
     /help     이 도움말      /exit     종료
     ${c.bold}!${c.reset}         Bash 모드 전환 ${c.dim}(exit로 복귀)${c.reset}
+
+  ${c.cyan}◆ 단축키${c.reset}
+    Shift+↑/↓   출력 기록 스크롤 모드
+                ${c.dim}↑↓:1줄  PgUp/Dn:페이지  Home/End  ESC:닫기${c.reset}
 `);
 }
 
@@ -3023,6 +3205,10 @@ async function main() {
 
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   _rl = rl;
+
+  // 스크롤 시스템 초기화 (출력 캡처 + 키 인터셉터)
+  initOutputCapture();
+  installScrollKeyHandler();
 
   function getPrompt() {
     if (bashMode) return `${c.yellow}bash${c.reset} ${c.dim}${path.basename(CFG.workspace)}${c.reset} ${c.yellow}▸${c.reset} `;
