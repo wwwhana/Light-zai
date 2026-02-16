@@ -103,6 +103,7 @@ const CFG = {
   maxTokens:  parseInt(process.env.LZAI_MAX_TOKENS   || savedCfg.maxTokens  || DEFAULT_CONFIG.maxTokens),
   temperature:parseFloat(process.env.LZAI_TEMPERATURE || savedCfg.temperature || DEFAULT_CONFIG.temperature),
   jsonMode:   false,
+  autoApprove: process.env.LZAI_AUTO_APPROVE === '1', // 도구 자동 승인 (기본: 꺼짐)
 };
 
 // ===== 전역 상태 =====
@@ -114,6 +115,7 @@ let mcpServers = {}; // { name: { url, tools: [...], sessionId } }
 let mcpLazy = {};    // { name: { config, tools: [...] } } — lazy 등록 (미연결)
 let activePreset = null; // { name, content }
 let hudEnabled = true; // 사용량 HUD 표시 여부
+let toolApproveSession = new Set(); // 세션 중 'always'로 승인된 도구
 const sessionUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0, requests: 0 };
 let apiAccountInfo = null; // API 계정 정보 (헤더 또는 엔드포인트에서 추출)
 
@@ -1130,11 +1132,12 @@ run_with_approval로 실행 가능한 명령:
 파일을 읽을 때는 반드시 read_file 도구를 사용하세요. bash 명령어를 텍스트로 출력하지 마세요.
 최신 정보가 필요하면 web_search를 적극 활용하세요.
 
-중요 — 도구 사용 확인 규칙:
-- execute_command, write_file 을 바로 쓰지 말고, 먼저 사용자에게 실행할 명령/파일을 설명하고 확인을 받으세요.
-- 확인 없이 즉시 사용해도 되는 도구: read_file, web_search, web_read
-- 사용자가 명시적으로 "실행해", "해줘", "ㄱㄱ" 등으로 지시하면 바로 실행하세요.
-- 복잡하거나 위험한 작업은 run_with_approval을 사용하세요 (사용자에게 y/n 확인 프롬프트가 표시됩니다).
+중요 — 도구 사용 규칙:
+- execute_command, write_file은 시스템이 자동으로 사용자에게 승인을 요청합니다 (y/n/a 프롬프트).
+  따라서 이 도구들을 자유롭게 호출하세요 — 실행 전에 시스템이 확인합니다.
+- 확인 없이 즉시 실행되는 도구: read_file, web_search, web_read
+- 복잡한 다단계 작업은 run_with_approval을 사용하세요 (슬래시 명령 지원).
+- 가능하면 작업을 세분화하여 한 번에 하나씩 도구를 호출하세요.
 `;
 
     // MCP 도구 설명 추가
@@ -1925,9 +1928,51 @@ const FUNCTION_TOOLS = [
   }},
 ];
 
+// ===== 도구 승인 =====
+// 위험 도구(execute_command, write_file)는 실행 전 사용자 확인 필요
+const DANGEROUS_TOOLS = new Set(['execute_command', 'write_file']);
+
+async function requireToolApproval(toolName, args) {
+  // 자동 승인 모드
+  if (CFG.autoApprove) return true;
+  // 세션 중 항상 허용한 도구
+  if (toolApproveSession.has(toolName)) return true;
+  // 안전한 도구는 즉시 허용
+  if (!DANGEROUS_TOOLS.has(toolName)) return true;
+
+  // 실행 내용 미리보기
+  if (toolName === 'execute_command') {
+    console.log(`\n  ${c.yellow}⚠ 명령 실행 요청${c.reset}`);
+    console.log(`    ${c.cyan}$ ${args.command}${c.reset}`);
+  } else if (toolName === 'write_file') {
+    const preview = (args.content || '').slice(0, 200);
+    const lines = (args.content || '').split('\n').length;
+    console.log(`\n  ${c.yellow}⚠ 파일 쓰기 요청${c.reset}`);
+    console.log(`    ${c.cyan}${args.path}${c.reset} ${c.dim}(${lines}줄, ${Buffer.byteLength(args.content || '')}B)${c.reset}`);
+    console.log(`    ${c.dim}${preview}${preview.length < (args.content || '').length ? '...' : ''}${c.reset}`);
+  }
+
+  const answer = await promptUser(`    허용? (${c.green}y${c.reset}/${c.red}n${c.reset}/${c.blue}a${c.reset}=항상) `);
+  if (answer === 'a' || answer === 'always' || answer === 'ㅁ') {
+    toolApproveSession.add(toolName);
+    console.log(`  ${c.blue}✓${c.reset} ${toolName} 세션 중 자동 승인`);
+    return true;
+  }
+  if (answer === 'y' || answer === 'yes' || answer === 'ㅛ') return true;
+  console.log(`  ${c.dim}거부됨${c.reset}`);
+  return false;
+}
+
 // ===== 도구 실행 =====
 async function executeTool(toolName, args) {
   console.log(`\n  ${c.magenta}◆${c.reset} ${c.bold}${toolName}${c.reset} ${c.dim}${JSON.stringify(args).slice(0,80)}${c.reset}`);
+  // 위험 도구: 사용자 승인 필요
+  const approved = await requireToolApproval(toolName, args);
+  if (!approved) {
+    console.log(`    ${c.red}✗ 거부됨${c.reset}`);
+    return { success: false, denied: true, message: '사용자가 실행을 거부했습니다' };
+  }
+
   let result;
   switch (toolName) {
     case 'read_file': {
@@ -2240,6 +2285,12 @@ async function handleSlashCommand(input, rl) {
       hudEnabled = !hudEnabled;
       console.log(`  사용량 HUD ${onoff(hudEnabled)}\n`);
       if (hudEnabled && lastUsage) renderHud();
+      break;
+
+    case 'approve':
+      CFG.autoApprove = !CFG.autoApprove;
+      toolApproveSession.clear();
+      console.log(`  도구 자동 승인 ${onoff(CFG.autoApprove)} ${CFG.autoApprove ? c.yellow + '(execute_command, write_file 확인 생략)' + c.reset : c.dim + '(실행 전 확인)' + c.reset}\n`);
       break;
 
     case 'usage': {
@@ -3370,6 +3421,7 @@ function printHelp() {
     /websearch      웹 검색 토글
     /json           JSON 모드 토글
     /hud            사용량 HUD 토글
+    /approve        도구 자동 승인 토글 (y/n/a 확인 생략)
     /usage          사용량 상세 (세션 + 구간별)
     /quota          쿼터 설정 (5h/daily/weekly)
     /account        API 계정 정보 (헤더/잔액/사용량)
@@ -3442,7 +3494,8 @@ function printStatus() {
     '',
     `${c.dim}스트리밍${c.reset}   ${onoff(CFG.stream)}     ${c.dim}사고${c.reset}   ${onoff(CFG.think)}`,
     `${c.dim}도구${c.reset}       ${onoff(CFG.tools)}     ${c.dim}검색${c.reset}   ${onoff(CFG.webSearch)}`,
-    `${c.dim}JSON${c.reset}       ${onoff(CFG.jsonMode)}     ${c.dim}HUD${c.reset}    ${onoff(hudEnabled)}`,
+    `${c.dim}승인${c.reset}       ${CFG.autoApprove ? c.yellow + '자동' + c.reset : c.green + '확인' + c.reset}${toolApproveSession.size ? c.dim + ` (+${[...toolApproveSession].join(',')})` + c.reset : ''}     ${c.dim}HUD${c.reset}    ${onoff(hudEnabled)}`,
+    `${c.dim}JSON${c.reset}       ${onoff(CFG.jsonMode)}`,
     '',
     `${c.dim}프리셋${c.reset}     ${activePreset ? c.green + activePreset.name + c.reset : c.dim + 'OFF' + c.reset}`,
     `${c.dim}MCP${c.reset}        ${mcpInfo}`,
