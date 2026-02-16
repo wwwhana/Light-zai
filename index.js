@@ -111,6 +111,7 @@ const conversationHistory = [];
 let lastUsage = null;
 let _rl = null; // REPL readline 인스턴스 (승인 프롬프트용)
 let mcpServers = {}; // { name: { url, tools: [...], sessionId } }
+let mcpLazy = {};    // { name: { config, tools: [...] } } — lazy 등록 (미연결)
 let activePreset = null; // { name, content }
 let hudEnabled = true; // 사용량 HUD 표시 여부
 const sessionUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0, requests: 0 };
@@ -1430,6 +1431,8 @@ function getScriptSkillTools() {
 }
 
 // ===== MCP 클라이언트 (HTTP + stdio) =====
+const MCP_TOOL_CACHE_FILE = path.join(CONFIG_DIR, 'mcp_tool_cache.json');
+
 function loadMcpConfig() {
   try {
     if (fs.existsSync(MCP_CONFIG_FILE)) return JSON.parse(fs.readFileSync(MCP_CONFIG_FILE, 'utf-8'));
@@ -1440,6 +1443,24 @@ function loadMcpConfig() {
 function saveMcpConfig(config) {
   ensureDir(CONFIG_DIR);
   fs.writeFileSync(MCP_CONFIG_FILE, JSON.stringify(config, null, 2), 'utf-8');
+}
+
+// 도구 캐시: lazy 모드에서 연결 없이 도구 목록 제공
+function loadMcpToolCache() {
+  try {
+    if (fs.existsSync(MCP_TOOL_CACHE_FILE)) return JSON.parse(fs.readFileSync(MCP_TOOL_CACHE_FILE, 'utf-8'));
+  } catch (_) {}
+  return {};
+}
+
+function saveMcpToolCache(cache) {
+  try { ensureDir(CONFIG_DIR); fs.writeFileSync(MCP_TOOL_CACHE_FILE, JSON.stringify(cache, null, 2), 'utf-8'); } catch (_) {}
+}
+
+function mcpUpdateToolCache(name, tools) {
+  const cache = loadMcpToolCache();
+  cache[name] = { tools, updatedAt: new Date().toISOString() };
+  saveMcpToolCache(cache);
 }
 
 // 서버 설정에서 트랜스포트 타입 판별
@@ -1612,6 +1633,8 @@ async function mcpConnect(name, serverCfg) {
     const tools = toolsRes.result?.tools || [];
 
     mcpServers[name] = { transport: 'http', url, tools, sessionId, headers };
+    delete mcpLazy[name]; // lazy → connected
+    mcpUpdateToolCache(name, tools);
     debugLog(`MCP ${name}: ${tools.length}개 도구 발견`);
     return tools;
 
@@ -1635,6 +1658,8 @@ async function mcpConnect(name, serverCfg) {
     const tools = toolsRes.result?.tools || [];
 
     mcpServers[name] = { transport: 'stdio', stdio, tools, command: serverCfg.command };
+    delete mcpLazy[name]; // lazy → connected
+    mcpUpdateToolCache(name, tools);
     debugLog(`MCP ${name}: ${tools.length}개 도구 발견`);
     return tools;
 
@@ -1654,6 +1679,12 @@ async function mcpDisconnect(name) {
 }
 
 async function mcpCallTool(serverName, toolName, args) {
+  // lazy 서버: 첫 호출 시 자동 연결
+  if (!mcpServers[serverName] && mcpLazy[serverName]) {
+    debugLog(`MCP lazy 연결: ${serverName}`);
+    console.log(`  ${c.dim}MCP ${serverName} 연결중...${c.reset}`);
+    await mcpConnect(serverName, mcpLazy[serverName].config);
+  }
   const server = mcpServers[serverName];
   if (!server) throw new Error(`MCP 서버 없음: ${serverName}`);
 
@@ -1675,34 +1706,70 @@ async function mcpCallTool(serverName, toolName, args) {
   }
 }
 
-// MCP 도구를 OpenAI function calling 형식으로 변환
+// MCP 도구를 OpenAI function calling 형식으로 변환 (연결된 + lazy 서버 모두 포함)
 function getMcpFunctionTools() {
   const tools = [];
+  const seen = new Set();
+  // 1) 연결된 서버
   for (const [serverName, server] of Object.entries(mcpServers)) {
     for (const tool of server.tools) {
+      const fname = `mcp__${serverName}__${tool.name}`;
+      seen.add(fname);
       tools.push({
         type: 'function',
-        function: {
-          name: `mcp__${serverName}__${tool.name}`,
-          description: tool.description || '',
-          parameters: tool.inputSchema || { type: 'object', properties: {} },
-        },
+        function: { name: fname, description: tool.description || '', parameters: tool.inputSchema || { type: 'object', properties: {} } },
+      });
+    }
+  }
+  // 2) lazy 서버 (캐시된 도구 목록)
+  for (const [serverName, lazy] of Object.entries(mcpLazy)) {
+    for (const tool of lazy.tools) {
+      const fname = `mcp__${serverName}__${tool.name}`;
+      if (seen.has(fname)) continue;
+      tools.push({
+        type: 'function',
+        function: { name: fname, description: tool.description || '', parameters: tool.inputSchema || { type: 'object', properties: {} } },
       });
     }
   }
   return tools;
 }
 
-// 시작 시 설정된 MCP 서버에 자동 연결
+// 시작 시 MCP 서버 등록 (lazy: 캐시 사용, eager: 즉시 연결)
+// mcp.json의 서버별 "lazy": false 로 즉시 연결 강제 가능 (기본값: true)
 async function mcpAutoConnect() {
   const config = loadMcpConfig();
   const servers = config.servers || {};
+  const toolCache = loadMcpToolCache();
+
   for (const [name, cfg] of Object.entries(servers)) {
-    try {
-      const tools = await mcpConnect(name, cfg);
-      console.log(`  ${c.green}✓${c.reset} MCP ${c.bold}${name}${c.reset}: ${tools.length}개 도구 연결됨`);
-    } catch (e) {
-      console.log(`  ${c.red}✗${c.reset} MCP ${name}: 연결 실패 - ${e.message}`);
+    const isLazy = cfg.lazy !== false; // 기본값: lazy
+
+    if (isLazy) {
+      // lazy: 캐시에서 도구 목록 로드 (연결 안함)
+      const cached = toolCache[name];
+      if (cached && cached.tools && cached.tools.length > 0) {
+        mcpLazy[name] = { config: cfg, tools: cached.tools };
+        console.log(`  ${c.blue}◇${c.reset} MCP ${c.bold}${name}${c.reset}: ${cached.tools.length}개 도구 ${c.dim}(lazy, 캐시)${c.reset}`);
+      } else {
+        // 캐시 없음 → 첫 연결 필요 (도구 목록 확보)
+        try {
+          const tools = await mcpConnect(name, cfg);
+          console.log(`  ${c.green}✓${c.reset} MCP ${c.bold}${name}${c.reset}: ${tools.length}개 도구 연결됨 ${c.dim}(캐시 생성)${c.reset}`);
+        } catch (e) {
+          // 연결 실패해도 lazy로 등록 (도구 없이)
+          mcpLazy[name] = { config: cfg, tools: [] };
+          console.log(`  ${c.yellow}△${c.reset} MCP ${name}: 캐시 없음, 첫 호출 시 연결 ${c.dim}(${e.message})${c.reset}`);
+        }
+      }
+    } else {
+      // eager: 즉시 연결
+      try {
+        const tools = await mcpConnect(name, cfg);
+        console.log(`  ${c.green}✓${c.reset} MCP ${c.bold}${name}${c.reset}: ${tools.length}개 도구 연결됨`);
+      } catch (e) {
+        console.log(`  ${c.red}✗${c.reset} MCP ${name}: 연결 실패 - ${e.message}`);
+      }
     }
   }
 }
@@ -2983,21 +3050,31 @@ async function cmdMcp(arg) {
       for (const sname of configServers) {
         const cfg = config.servers[sname];
         const connected = mcpServers[sname];
-        const toolCount = connected ? connected.tools.length : 0;
-        const status = connected ? `${c.green}연결됨${c.reset} (${toolCount}개 도구)` : `${c.dim}연결 안됨${c.reset}`;
-        const transport = mcpTransportType(cfg);
-        const target = transport === 'stdio' ? `${cfg.command} ${(cfg.args || []).join(' ')}` : cfg.url;
-        console.log(`  ${c.cyan}${sname.padEnd(15)}${c.reset} [${transport}] ${status}`);
-        console.log(`  ${c.dim}${' '.repeat(15)} ${target}${c.reset}`);
+        const lazy = mcpLazy[sname];
+        let status, toolCount;
         if (connected) {
-          for (const t of connected.tools) {
-            console.log(`  ${' '.repeat(15)} ${c.magenta}${t.name}${c.reset} ${c.dim}${(t.description || '').slice(0, 50)}${c.reset}`);
-          }
+          toolCount = connected.tools.length;
+          status = `${c.green}연결됨${c.reset} (${toolCount}개 도구)`;
+        } else if (lazy) {
+          toolCount = lazy.tools.length;
+          status = `${c.blue}lazy${c.reset} (${toolCount}개 도구, 호출 시 연결)`;
+        } else {
+          toolCount = 0;
+          status = `${c.dim}연결 안됨${c.reset}`;
+        }
+        const transport = mcpTransportType(cfg);
+        const lazyFlag = cfg.lazy !== false ? ` ${c.blue}lazy${c.reset}` : '';
+        const target = transport === 'stdio' ? `${cfg.command} ${(cfg.args || []).join(' ')}` : cfg.url;
+        console.log(`  ${c.cyan}${sname.padEnd(15)}${c.reset} [${transport}${lazyFlag}] ${status}`);
+        console.log(`  ${c.dim}${' '.repeat(15)} ${target}${c.reset}`);
+        const toolList = connected ? connected.tools : (lazy ? lazy.tools : []);
+        for (const t of toolList) {
+          console.log(`  ${' '.repeat(15)} ${c.magenta}${t.name}${c.reset} ${c.dim}${(t.description || '').slice(0, 50)}${c.reset}`);
         }
       }
       console.log(`\n  /mcp add <이름> <URL>              HTTP 서버 등록`);
       console.log(`  /mcp stdio <이름> <명령> [인자...] [--env K=V ...]  stdio 서버 등록`);
-      console.log(`  /mcp remove|connect|disconnect|tools\n`);
+      console.log(`  /mcp remove|connect|disconnect|tools|lazy|refresh\n`);
       break;
     }
     case 'add': {
@@ -3043,6 +3120,10 @@ async function cmdMcp(arg) {
         saveMcpConfig(config);
       }
       await mcpDisconnect(name);
+      delete mcpLazy[name];
+      // 도구 캐시도 정리
+      const cache = loadMcpToolCache();
+      if (cache[name]) { delete cache[name]; saveMcpToolCache(cache); }
       console.log(`${c.green}MCP 서버 제거: ${name}${c.reset}\n`);
       break;
     }
@@ -3081,8 +3162,39 @@ async function cmdMcp(arg) {
       console.log('');
       break;
     }
+    case 'refresh': {
+      // 캐시 갱신: lazy 서버를 일시 연결하여 도구 목록 갱신 후 다시 lazy로 전환
+      if (!name) { console.log(`${c.yellow}사용법: /mcp refresh <이름>${c.reset}\n`); return; }
+      const config = loadMcpConfig();
+      const serverCfg = config.servers?.[name];
+      if (!serverCfg) { console.log(`${c.red}등록되지 않은 서버: ${name}${c.reset}\n`); return; }
+      const spin = createSpinner(`MCP 도구 캐시 갱신중... (${name})`).start();
+      try {
+        const tools = await mcpConnect(name, serverCfg);
+        // 연결 후 즉시 해제하여 lazy 상태 복원
+        await mcpDisconnect(name);
+        mcpLazy[name] = { config: serverCfg, tools };
+        spin.succeed(`캐시 갱신: ${name} (${tools.length}개 도구)`);
+      } catch (e) {
+        spin.fail(`캐시 갱신 실패: ${e.message}`);
+      }
+      console.log('');
+      break;
+    }
+    case 'lazy': {
+      // /mcp lazy <이름> — lazy 모드 토글
+      if (!name) { console.log(`${c.yellow}사용법: /mcp lazy <이름>${c.reset}\n`); return; }
+      const config = loadMcpConfig();
+      if (!config.servers?.[name]) { console.log(`${c.red}등록되지 않은 서버: ${name}${c.reset}\n`); return; }
+      const current = config.servers[name].lazy !== false;
+      config.servers[name].lazy = !current;
+      saveMcpConfig(config);
+      const newState = !current ? `${c.blue}lazy${c.reset} (호출 시 연결)` : `${c.green}eager${c.reset} (시작 시 연결)`;
+      console.log(`${c.green}MCP ${name}${c.reset}: ${newState}\n`);
+      break;
+    }
     default:
-      console.log(`  사용법: /mcp [list|add|stdio|remove|connect|disconnect|tools]\n`);
+      console.log(`  사용법: /mcp [list|add|stdio|remove|connect|disconnect|tools|refresh|lazy]\n`);
   }
 }
 
@@ -3291,12 +3403,14 @@ function printHelp() {
     /skill show     스킬 내용 보기
     /skill edit     스킬 편집
 
-  ${c.cyan}◆ MCP 서버${c.reset}
+  ${c.cyan}◆ MCP 서버${c.reset} ${c.dim}(기본 lazy: 호출 시 자동 연결)${c.reset}
     /mcp                         서버 목록
     /mcp add <이름> <URL>        HTTP 서버 등록
     /mcp stdio <이름> <cmd...>   stdio 서버 등록
     /mcp connect|disconnect      서버 연결/해제
-    /mcp tools                   연결된 MCP 도구
+    /mcp tools                   MCP 도구 목록
+    /mcp lazy <이름>             lazy 모드 토글
+    /mcp refresh <이름>          도구 캐시 갱신
 
   ${c.cyan}◆ 기타${c.reset}
     /doctor   시스템 진단    /status   현재 상태
@@ -3313,9 +3427,12 @@ function printStatus() {
   const msgCount = conversationHistory.length - 1;
   const turns = Math.floor(msgCount / 2);
   const mode = bashMode ? `${c.yellow}Bash${c.reset}` : `${c.green}AI${c.reset}`;
-  const mcpInfo = Object.keys(mcpServers).length > 0
-    ? `${c.green}${Object.keys(mcpServers).join(', ')}${c.reset} (${getMcpFunctionTools().length}개 도구)`
-    : `${c.dim}없음${c.reset}`;
+  const connNames = Object.keys(mcpServers);
+  const lazyNames = Object.keys(mcpLazy);
+  const mcpParts = [];
+  if (connNames.length) mcpParts.push(`${c.green}${connNames.join(', ')}${c.reset}`);
+  if (lazyNames.length) mcpParts.push(`${c.blue}${lazyNames.join(', ')}${c.reset}${c.dim}(lazy)${c.reset}`);
+  const mcpInfo = mcpParts.length ? `${mcpParts.join(', ')} (${getMcpFunctionTools().length}개 도구)` : `${c.dim}없음${c.reset}`;
   const tokenInfo = lastUsage
     ? `입력 ${lastUsage.prompt_tokens || '?'} + 출력 ${lastUsage.completion_tokens || '?'} = ${c.bold}${lastUsage.total_tokens || '?'}${c.reset}`
     : `${c.dim}없음${c.reset}`;
