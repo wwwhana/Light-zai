@@ -23,6 +23,8 @@ const SESSIONS_DIR = path.join(CONFIG_DIR, 'sessions');
 const PRESETS_DIR = path.join(CONFIG_DIR, 'presets');
 const SKILLS_DIR = path.join(CONFIG_DIR, 'skills');
 const MCP_CONFIG_FILE = path.join(CONFIG_DIR, 'mcp.json');
+const USAGE_LOG_FILE = path.join(CONFIG_DIR, 'usage-log.json');
+const QUOTA_FILE = path.join(CONFIG_DIR, 'quota.json');
 
 // ===== ANSI 색상 =====
 const IS_TTY = process.stdout.isTTY;
@@ -101,6 +103,7 @@ const CFG = {
   maxTokens:  parseInt(process.env.LZAI_MAX_TOKENS   || savedCfg.maxTokens  || DEFAULT_CONFIG.maxTokens),
   temperature:parseFloat(process.env.LZAI_TEMPERATURE || savedCfg.temperature || DEFAULT_CONFIG.temperature),
   jsonMode:   false,
+  autoApprove: process.env.LZAI_AUTO_APPROVE === '1', // 도구 자동 승인 (기본: 꺼짐)
 };
 
 // ===== 전역 상태 =====
@@ -109,7 +112,12 @@ const conversationHistory = [];
 let lastUsage = null;
 let _rl = null; // REPL readline 인스턴스 (승인 프롬프트용)
 let mcpServers = {}; // { name: { url, tools: [...], sessionId } }
+let mcpLazy = {};    // { name: { config, tools: [...] } } — lazy 등록 (미연결)
 let activePreset = null; // { name, content }
+let hudEnabled = true; // 사용량 HUD 표시 여부
+let toolApproveSession = new Set(); // 세션 중 'always'로 승인된 도구
+const sessionUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0, requests: 0 };
+let apiAccountInfo = null; // API 계정 정보 (헤더 또는 엔드포인트에서 추출)
 
 // ===== 유틸리티 =====
 function debugLog(...args) { if (CFG.debug) console.log(`${c.dim}[DEBUG]${c.reset}`, ...args); }
@@ -118,6 +126,433 @@ function formatBytes(b) {
   if (b < 1024) return b + 'B';
   if (b < 1024*1024) return (b/1024).toFixed(1) + 'KB';
   return (b/1024/1024).toFixed(1) + 'MB';
+}
+
+// ===== TUI 유틸리티 =====
+
+// ANSI 코드 제거 (문자열 길이 계산용)
+function stripAnsi(str) {
+  return str.replace(/\x1b\[[0-9;]*m/g, '');
+}
+
+// 애니메이션 스피너
+function createSpinner(text) {
+  if (!IS_TTY) return {
+    start() { process.stdout.write(text + '... '); return this; },
+    stop() { },
+    succeed(msg) { if (msg) console.log(msg); },
+    fail(msg) { if (msg) console.log(msg); },
+  };
+  const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+  let i = 0, timer = null;
+  const t0 = Date.now();
+  return {
+    start() {
+      timer = setInterval(() => {
+        const sec = Math.floor((Date.now() - t0) / 1000);
+        const el = sec > 0 ? ` ${c.dim}(${sec}초)${c.reset}` : '';
+        process.stdout.write(`\r\x1b[K  ${c.cyan}${frames[i]}${c.reset} ${text}${el}`);
+        i = (i + 1) % frames.length;
+      }, 80);
+      return this;
+    },
+    stop() { if (timer) { clearInterval(timer); timer = null; } process.stdout.write('\r\x1b[K'); },
+    succeed(msg) { this.stop(); if (msg) console.log(`  ${c.green}✓${c.reset} ${msg}`); },
+    fail(msg) { this.stop(); if (msg) console.log(`  ${c.red}✗${c.reset} ${msg}`); },
+  };
+}
+
+// 박스 그리기 (라운드 코너)
+function drawBox(content, options) {
+  options = options || {};
+  const title = options.title;
+  const color = options.color || c.dim;
+  const pad = options.pad != null ? options.pad : 1;
+  const lines = typeof content === 'string' ? content.split('\n') : content;
+  const maxLen = Math.max(0, ...lines.map(function(l) { return stripAnsi(l).length; }), title ? stripAnsi(title).length + 4 : 0);
+  const w = maxLen + pad * 2;
+
+  let top;
+  if (title) {
+    const tLen = stripAnsi(title).length;
+    top = color + '╭─' + c.reset + ' ' + title + ' ' + color + '─'.repeat(Math.max(0, w - tLen - 3)) + '╮' + c.reset;
+  } else {
+    top = color + '╭' + '─'.repeat(w) + '╮' + c.reset;
+  }
+  const bottom = color + '╰' + '─'.repeat(w) + '╯' + c.reset;
+
+  const body = lines.map(function(line) {
+    const vis = stripAnsi(line).length;
+    return color + '│' + c.reset + ' '.repeat(pad) + line + ' '.repeat(Math.max(0, maxLen - vis + pad)) + color + '│' + c.reset;
+  });
+  return [top].concat(body, [bottom]).join('\n');
+}
+
+// 상태 표시 (ON/OFF)
+function onoff(val) {
+  return val ? c.green + '● ON' + c.reset : c.dim + '○ OFF' + c.reset;
+}
+
+// ===== 스크롤 시스템 (Shift+Up/Down) =====
+const scrollState = {
+  lines: [],       // 캡처된 출력 라인들
+  active: false,   // 스크롤 모드 활성
+  offset: 0,       // 현재 스크롤 위치 (하단 기준 오프셋)
+  maxLines: 5000,  // 최대 보관 라인 수
+};
+
+let _origStdoutWrite = null;
+
+// stdout 출력 캡처 시작
+function initOutputCapture() {
+  if (!IS_TTY || _origStdoutWrite) return;
+  _origStdoutWrite = process.stdout.write.bind(process.stdout);
+
+  process.stdout.write = function(chunk, encoding, callback) {
+    // 스크롤 모드 중에는 캡처하지 않음 (렌더링 출력)
+    if (!scrollState.active) {
+      const str = typeof chunk === 'string' ? chunk : chunk.toString(encoding || 'utf-8');
+      // \r로 시작하면 현재 줄 덮어쓰기 (스피너 등) - 마지막 줄 교체
+      if (str.startsWith('\r') || str.startsWith('\x1b[K')) {
+        // 스피너 업데이트는 무시 (불필요한 중간 프레임)
+      } else {
+        // 줄바꿈으로 분할하여 저장
+        const parts = str.split('\n');
+        for (let i = 0; i < parts.length; i++) {
+          if (i === 0 && scrollState.lines.length > 0) {
+            // 첫 부분은 이전 줄에 이어붙이기
+            scrollState.lines[scrollState.lines.length - 1] += parts[i];
+          } else {
+            scrollState.lines.push(parts[i]);
+          }
+        }
+        // 최대 라인 수 제한
+        if (scrollState.lines.length > scrollState.maxLines) {
+          scrollState.lines = scrollState.lines.slice(-scrollState.maxLines);
+        }
+      }
+    }
+    return _origStdoutWrite(chunk, encoding, callback);
+  };
+}
+
+// 스크롤 뷰 렌더링 (대체 화면 버퍼)
+function renderScrollView() {
+  const rows = process.stdout.rows || 24;
+  const cols = process.stdout.columns || 80;
+  const totalLines = scrollState.lines.length;
+  const viewHeight = rows - 1; // 상태바 1줄 제외
+
+  // 표시할 영역 계산
+  const endIdx = Math.max(0, totalLines - scrollState.offset);
+  const startIdx = Math.max(0, endIdx - viewHeight);
+
+  // 화면 클리어 + 커서 홈
+  let out = '\x1b[2J\x1b[H';
+
+  // 출력 라인 표시
+  const visibleLines = scrollState.lines.slice(startIdx, endIdx);
+  for (let i = 0; i < viewHeight; i++) {
+    if (i < visibleLines.length) {
+      // 화면 폭 초과 시 잘라내기 (ANSI 고려)
+      const line = visibleLines[i];
+      out += line;
+    }
+    out += '\n';
+  }
+
+  // 상태바 (하단)
+  const pct = totalLines > 0 ? Math.round(((endIdx) / totalLines) * 100) : 100;
+  const pos = `${endIdx}/${totalLines} (${pct}%)`;
+  const keys = '↑↓:1줄  PgUp/Dn:페이지  Home/End  ESC:닫기';
+  const barText = ` 스크롤  ${pos}  │  ${keys} `;
+  const padLen = Math.max(0, cols - stripAnsi(barText).length);
+  out += `\x1b[7m${barText}${' '.repeat(padLen)}\x1b[0m`;
+
+  _origStdoutWrite(out);
+}
+
+// 스크롤 모드 진입
+function enterScrollMode() {
+  if (!IS_TTY || scrollState.active) return;
+  if (scrollState.lines.length === 0) return;
+
+  scrollState.active = true;
+  scrollState.offset = 0;
+
+  // 대체 화면 버퍼 진입 + 커서 숨기기
+  _origStdoutWrite('\x1b[?1049h\x1b[?25l');
+  renderScrollView();
+}
+
+// 스크롤 모드 종료
+function exitScrollMode() {
+  if (!scrollState.active) return;
+  scrollState.active = false;
+
+  // 대체 화면 버퍼 종료 + 커서 표시
+  _origStdoutWrite('\x1b[?1049l\x1b[?25h');
+
+  // readline 프롬프트 다시 표시
+  if (_rl) { _rl.prompt(true); }
+}
+
+// 스크롤 키 입력 처리
+function handleScrollKey(key) {
+  const rows = process.stdout.rows || 24;
+  const viewHeight = rows - 1;
+  const maxOffset = Math.max(0, scrollState.lines.length - viewHeight);
+
+  switch (key) {
+    case 'up':
+      scrollState.offset = Math.min(maxOffset, scrollState.offset + 1);
+      break;
+    case 'down':
+      scrollState.offset = Math.max(0, scrollState.offset - 1);
+      break;
+    case 'pageup':
+      scrollState.offset = Math.min(maxOffset, scrollState.offset + viewHeight);
+      break;
+    case 'pagedown':
+      scrollState.offset = Math.max(0, scrollState.offset - viewHeight);
+      break;
+    case 'home':
+      scrollState.offset = maxOffset;
+      break;
+    case 'end':
+      scrollState.offset = 0;
+      break;
+    case 'escape': case 'q':
+      exitScrollMode();
+      return;
+  }
+  renderScrollView();
+}
+
+// 키프레스 인터셉터 설치 (readline 전에 키 가로채기)
+function installScrollKeyHandler() {
+  if (!IS_TTY) return;
+
+  // stdin의 keypress 이벤트를 직접 감시
+  const origEmit = process.stdin.emit.bind(process.stdin);
+  process.stdin.emit = function(event, key, meta) {
+    // keypress 이벤트 인터셉트
+    if (event === 'keypress') {
+      const k = meta || key;
+      if (k) {
+        // 스크롤 모드 중 키 처리
+        if (scrollState.active) {
+          if (k.name === 'pageup') { handleScrollKey('pageup'); return false; }
+          if (k.name === 'pagedown') { handleScrollKey('pagedown'); return false; }
+          if (k.name === 'up' && k.ctrl) { handleScrollKey('pageup'); return false; }
+          if (k.name === 'down' && k.ctrl) { handleScrollKey('pagedown'); return false; }
+          if (k.name === 'up') { handleScrollKey('up'); return false; }
+          if (k.name === 'down') { handleScrollKey('down'); return false; }
+          if (k.name === 'home') { handleScrollKey('home'); return false; }
+          if (k.name === 'end') { handleScrollKey('end'); return false; }
+          if (k.name === 'escape' || (k.name === 'q' && !k.ctrl && !k.meta)) { handleScrollKey('escape'); return false; }
+          // 스크롤 모드에서는 다른 키 입력 차단
+          return false;
+        }
+
+        // Shift+Up: 스크롤 모드 진입
+        if (k.name === 'up' && k.shift && !k.ctrl && !k.meta) {
+          enterScrollMode();
+          return false;
+        }
+        // Shift+Down 도 동일
+        if (k.name === 'down' && k.shift && !k.ctrl && !k.meta) {
+          enterScrollMode();
+          return false;
+        }
+      }
+    }
+    return origEmit.apply(process.stdin, arguments);
+  };
+}
+
+// 토큰 수 간결 표시 (1234 → 1.2K)
+function fmtTokens(n) {
+  if (!n && n !== 0) return '?';
+  if (n < 1000) return String(n);
+  if (n < 10000) return (n / 1000).toFixed(1) + 'K';
+  return Math.round(n / 1000) + 'K';
+}
+
+// ===== 쿼터 / 사용량 로그 시스템 =====
+const QUOTA_WINDOWS = {
+  '5h':   5 * 60 * 60 * 1000,
+  'daily': 24 * 60 * 60 * 1000,
+  'weekly': 7 * 24 * 60 * 60 * 1000,
+};
+
+// 쿼터 기본값 (0 = 제한 없음)
+const DEFAULT_QUOTA = { '5h': 0, 'daily': 0, 'weekly': 0 };
+
+function loadQuota() {
+  try {
+    if (fs.existsSync(QUOTA_FILE)) return { ...DEFAULT_QUOTA, ...JSON.parse(fs.readFileSync(QUOTA_FILE, 'utf-8')) };
+  } catch (_) {}
+  return { ...DEFAULT_QUOTA };
+}
+
+function saveQuota(q) {
+  ensureDir(CONFIG_DIR);
+  fs.writeFileSync(QUOTA_FILE, JSON.stringify(q, null, 2), 'utf-8');
+}
+
+let quotaLimits = loadQuota();
+
+// 사용량 로그: [{ ts, pt, ct, tt, model }]
+function loadUsageLog() {
+  try {
+    if (fs.existsSync(USAGE_LOG_FILE)) return JSON.parse(fs.readFileSync(USAGE_LOG_FILE, 'utf-8'));
+  } catch (_) {}
+  return [];
+}
+
+function appendUsageLog(entry) {
+  const log = loadUsageLog();
+  log.push(entry);
+  // 30일 이상 된 기록 정리
+  const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  const trimmed = log.filter(function(e) { return e.ts > cutoff; });
+  ensureDir(CONFIG_DIR);
+  fs.writeFileSync(USAGE_LOG_FILE, JSON.stringify(trimmed), 'utf-8');
+}
+
+// 특정 윈도우 내 사용량 합산
+function getWindowUsage(windowMs) {
+  const log = loadUsageLog();
+  const since = Date.now() - windowMs;
+  let pt = 0, ct = 0, tt = 0, reqs = 0;
+  for (const e of log) {
+    if (e.ts >= since) {
+      pt += e.pt || 0;
+      ct += e.ct || 0;
+      tt += e.tt || 0;
+      reqs++;
+    }
+  }
+  return { promptTokens: pt, completionTokens: ct, totalTokens: tt, requests: reqs };
+}
+
+// 쿼터 초과 확인 (0 = 제한 없음)
+function checkQuota() {
+  const warnings = [];
+  for (const [key, ms] of Object.entries(QUOTA_WINDOWS)) {
+    const limit = quotaLimits[key];
+    if (!limit) continue;
+    const usage = getWindowUsage(ms);
+    const pct = Math.round((usage.totalTokens / limit) * 100);
+    if (pct >= 100) {
+      warnings.push({ key, pct, usage: usage.totalTokens, limit, level: 'over' });
+    } else if (pct >= 80) {
+      warnings.push({ key, pct, usage: usage.totalTokens, limit, level: 'warn' });
+    }
+  }
+  return warnings;
+}
+
+// 쿼터 진행률 바 (10칸)
+function quotaBar(used, limit) {
+  if (!limit) return '';
+  const pct = Math.min(1, used / limit);
+  const filled = Math.round(pct * 10);
+  const empty = 10 - filled;
+  let color;
+  if (pct >= 1) color = c.red;
+  else if (pct >= 0.8) color = c.yellow;
+  else color = c.green;
+  return color + '█'.repeat(filled) + c.dim + '░'.repeat(empty) + c.reset + ' ' + Math.round(pct * 100) + '%';
+}
+
+// 윈도우 이름 한국어
+function windowLabel(key) {
+  if (key === '5h') return '5시간';
+  if (key === 'daily') return '일간';
+  if (key === 'weekly') return '주간';
+  return key;
+}
+
+// 사용량 누적
+function trackUsage(usage) {
+  if (!usage) return;
+  lastUsage = usage;
+  sessionUsage.requests++;
+  sessionUsage.promptTokens += usage.prompt_tokens || 0;
+  sessionUsage.completionTokens += usage.completion_tokens || 0;
+  sessionUsage.totalTokens += usage.total_tokens || 0;
+  // 디스크 로그 기록
+  appendUsageLog({
+    ts: Date.now(),
+    pt: usage.prompt_tokens || 0,
+    ct: usage.completion_tokens || 0,
+    tt: usage.total_tokens || 0,
+    model: CFG.model,
+  });
+}
+
+// 사용량 HUD 렌더링
+function renderHud(elapsed) {
+  if (!hudEnabled || !IS_TTY || !lastUsage) return;
+  const u = lastUsage;
+  const pt = fmtTokens(u.prompt_tokens);
+  const ct = fmtTokens(u.completion_tokens);
+  const tt = fmtTokens(u.total_tokens);
+  const st = fmtTokens(sessionUsage.totalTokens);
+  const elStr = elapsed ? (elapsed / 1000).toFixed(1) + '초' : '';
+
+  const parts = [
+    `${c.dim}입력${c.reset} ${pt}`,
+    `${c.dim}출력${c.reset} ${ct}`,
+    `${c.dim}=${c.reset} ${c.bold}${tt}${c.reset}`,
+  ];
+  const extra = [];
+  if (elStr) extra.push(`${c.dim}${elStr}${c.reset}`);
+
+  // 쿼터/구간 사용량 (항상 표시)
+  const hasAnyLimit = Object.values(quotaLimits).some(function(v) { return v > 0; });
+  if (hasAnyLimit) {
+    // 한도 설정된 구간들: 진행률 바
+    for (const [key, ms] of Object.entries(QUOTA_WINDOWS)) {
+      const limit = quotaLimits[key];
+      if (!limit) continue;
+      const wu = getWindowUsage(ms);
+      extra.push(`${c.dim}${windowLabel(key)}${c.reset} ${quotaBar(wu.totalTokens, limit)}`);
+    }
+  } else {
+    // 한도 없으면 구간 사용량만 간결히 표시
+    const w5h = getWindowUsage(QUOTA_WINDOWS['5h']);
+    const wDay = getWindowUsage(QUOTA_WINDOWS['daily']);
+    const wWeek = getWindowUsage(QUOTA_WINDOWS['weekly']);
+    extra.push(`${c.dim}5h${c.reset} ${fmtTokens(w5h.totalTokens)}`);
+    extra.push(`${c.dim}일${c.reset} ${fmtTokens(wDay.totalTokens)}`);
+    extra.push(`${c.dim}주${c.reset} ${fmtTokens(wWeek.totalTokens)}`);
+  }
+
+  // API 계정 정보 (rate-limit / 잔액)
+  if (apiAccountInfo) {
+    const rem = apiAccountInfo['x-ratelimit-remaining-tokens'] || apiAccountInfo['x-token-remaining'] || apiAccountInfo['ratelimit-remaining'];
+    const lim = apiAccountInfo['x-ratelimit-limit-tokens'] || apiAccountInfo['x-token-limit'] || apiAccountInfo['ratelimit-limit'];
+    const bal = apiAccountInfo['x-balance'] || apiAccountInfo['x-credits'] || apiAccountInfo['x-remaining-credits'] || apiAccountInfo['x-account-balance'];
+    if (rem && lim) extra.push(`${c.dim}RPM${c.reset} ${fmtTokens(Number(rem))}/${fmtTokens(Number(lim))}`);
+    else if (rem) extra.push(`${c.dim}잔여${c.reset} ${fmtTokens(Number(rem))}`);
+    if (bal) extra.push(`${c.dim}잔액${c.reset} ${bal}`);
+  }
+
+  const line = `  ${c.dim}──${c.reset} ${parts.join(` ${c.dim}+${c.reset} `)}${extra.length ? ` ${c.dim}│${c.reset} ` + extra.join(` ${c.dim}│${c.reset} `) : ''} ${c.dim}──${c.reset}`;
+  console.log(line);
+
+  // 쿼터 경고
+  const warnings = checkQuota();
+  for (const w of warnings) {
+    if (w.level === 'over') {
+      console.log(`  ${c.bgRed}${c.bold} ⚠ ${windowLabel(w.key)} 쿼터 초과 ${c.reset} ${fmtTokens(w.usage)} / ${fmtTokens(w.limit)} (${w.pct}%)`);
+    } else if (w.level === 'warn') {
+      console.log(`  ${c.yellow}⚠ ${windowLabel(w.key)} 쿼터 ${w.pct}%${c.reset} ${c.dim}(${fmtTokens(w.usage)} / ${fmtTokens(w.limit)})${c.reset}`);
+    }
+  }
 }
 
 function getMimeType(ext) {
@@ -140,6 +575,8 @@ function httpRequest(options, body) {
       res.on('end', () => {
         debugLog(`HTTP ${res.statusCode} ${options.path}`);
         if (data) debugLog('응답:', truncate(data, 500));
+        // API 계정 정보 헤더 캡처
+        captureApiHeaders(res.headers);
         try {
           const json = JSON.parse(data);
           if (res.statusCode >= 400) {
@@ -165,6 +602,8 @@ function httpStream(options, body, callbacks) {
     const { onToken, onReasoning, onToolCall, onSearchResult, onDone, onUsage } = callbacks;
     const proto = options.protocol === 'http:' ? http : https;
     const req = proto.request(options, (res) => {
+      // API 계정 정보 헤더 캡처
+      captureApiHeaders(res.headers);
       if (res.statusCode >= 400) {
         let data = '';
         res.on('data', (chunk) => { data += chunk; });
@@ -260,6 +699,132 @@ function buildMultipart(fields, files) {
   return { contentType: `multipart/form-data; boundary=${boundary}`, body: Buffer.concat(chunks) };
 }
 
+// ===== API 계정 정보 (헤더에서 추출) =====
+// 알려진 rate-limit / balance 헤더 키
+const ACCOUNT_HEADER_KEYS = [
+  'x-ratelimit-limit-requests', 'x-ratelimit-limit-tokens',
+  'x-ratelimit-remaining-requests', 'x-ratelimit-remaining-tokens',
+  'x-ratelimit-reset-requests', 'x-ratelimit-reset-tokens',
+  'x-request-limit', 'x-request-remaining',
+  'x-token-limit', 'x-token-remaining',
+  'x-balance', 'x-credits', 'x-remaining-credits',
+  'x-quota-limit', 'x-quota-remaining', 'x-quota-used',
+  'x-account-balance', 'x-monthly-usage', 'x-daily-usage',
+  'retry-after', 'ratelimit-limit', 'ratelimit-remaining', 'ratelimit-reset',
+];
+
+function captureApiHeaders(headers) {
+  if (!headers) return;
+  const info = {};
+  let found = false;
+  for (const key of ACCOUNT_HEADER_KEYS) {
+    if (headers[key] !== undefined) {
+      info[key] = headers[key];
+      found = true;
+    }
+  }
+  // 모든 x-ratelimit- 계열 헤더 캡처
+  for (const key of Object.keys(headers)) {
+    if ((key.startsWith('x-ratelimit') || key.startsWith('x-quota') || key.startsWith('x-balance') || key.startsWith('x-credit')) && !info[key]) {
+      info[key] = headers[key];
+      found = true;
+    }
+  }
+  if (found) {
+    apiAccountInfo = info;
+    debugLog('API 계정 헤더:', JSON.stringify(info));
+  }
+}
+
+// API 제공자 감지
+function detectProvider() {
+  const host = CFG.baseUrl.toLowerCase();
+  if (host.includes('openai') || host.includes('api.openai.com')) return 'openai';
+  if (host.includes('anthropic') || host.includes('claude')) return 'anthropic';
+  if (host.includes('z.ai') || host.includes('bigmodel')) return 'zhipu';
+  return 'unknown';
+}
+
+// 사용량 엔드포인트 탐색 (제공자별)
+async function fetchApiUsage() {
+  const provider = detectProvider();
+  const now = new Date();
+  const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+
+  // OpenAI: /v1/organization/usage/completions
+  if (provider === 'openai') {
+    const startSec = Math.floor(weekAgo.getTime() / 1000);
+    const endpoints = [
+      `/v1/organization/usage/completions?start_time=${startSec}&bucket_width=1d`,
+      `/v1/organization/usage?start_time=${startSec}&bucket_width=1d`,
+      `/v1/dashboard/billing/usage?start_date=${fmt(weekAgo)}&end_date=${fmt(now)}`,
+      `/v1/dashboard/billing/subscription`,
+    ];
+    for (const p of endpoints) {
+      try {
+        debugLog('OpenAI 사용량 조회:', p);
+        const res = await apiGet(p);
+        if (res && typeof res === 'object') return { provider: 'OpenAI', path: p, data: res };
+      } catch (_) {}
+    }
+  }
+
+  // Anthropic: /v1/organizations/usage_report/messages (Admin API 키 필요)
+  if (provider === 'anthropic') {
+    const startISO = weekAgo.toISOString();
+    const endISO = now.toISOString();
+    const endpoints = [
+      `/v1/organizations/usage_report/messages?starting_at=${startISO}&ending_at=${endISO}&bucket_width=1d`,
+      `/v1/organizations/cost_report?starting_at=${startISO}&ending_at=${endISO}`,
+    ];
+    const anthropicHeaders = { 'anthropic-version': '2023-06-01', 'x-api-key': CFG.apiKey };
+    for (const p of endpoints) {
+      try {
+        debugLog('Anthropic 사용량 조회:', p);
+        const opts = {
+          hostname: CFG.baseUrl, port: 443, protocol: 'https:',
+          path: p, method: 'GET',
+          headers: { ...anthropicHeaders, 'Accept-Language': 'ko-KR,ko' },
+          timeout: 15000,
+        };
+        const res = await httpRequest(opts);
+        if (res && typeof res === 'object') return { provider: 'Anthropic', path: p, data: res };
+      } catch (_) {}
+    }
+  }
+
+  // ZhipuAI / 일반: 비공식 탐색
+  const genericPaths = [
+    CFG.apiPrefix + '/usage',
+    CFG.apiPrefix + '/billing/usage',
+    CFG.apiPrefix + '/balance',
+    CFG.apiPrefix + '/account',
+    CFG.apiPrefix + '/quota',
+    CFG.apiPrefix + '/dashboard/billing/usage',
+    CFG.apiPrefix + '/dashboard/billing/subscription',
+    CFG.apiPrefix + '/dashboard/billing/credit_grants',
+    '/api/paas/v4/usage',
+    '/api/paas/v4/balance',
+    '/api/paas/v4/finance/balance',
+    '/api/user/usage',
+    '/api/user/balance',
+    '/api/user/finance',
+  ];
+  for (const p of genericPaths) {
+    try {
+      debugLog('사용량 조회 시도:', p);
+      const res = await apiGet(p);
+      if (res && typeof res === 'object') {
+        debugLog('사용량 응답:', JSON.stringify(res).slice(0, 500));
+        return { provider: provider === 'zhipu' ? 'ZhipuAI' : CFG.baseUrl, path: p, data: res };
+      }
+    } catch (_) {}
+  }
+  return null;
+}
+
+function fmt(d) { return d.toISOString().slice(0, 10); }
+
 // ===== API 요청 헬퍼 =====
 function apiOpts(method, apiPath, extraHeaders) {
   return {
@@ -319,7 +884,7 @@ async function zaiChat(messages, options = {}) {
   if (options.stop) payload.stop = options.stop;
 
   const res = await apiPost(CFG.apiPrefix + '/chat/completions', payload);
-  if (res.usage) lastUsage = res.usage;
+  if (res.usage) trackUsage(res.usage);
   return res;
 }
 
@@ -403,15 +968,17 @@ async function zaiAsyncResult(taskId) {
 async function zaiPollResult(taskId, intervalMs, timeoutMs) {
   intervalMs = intervalMs || 5000;
   timeoutMs = timeoutMs || 300000;
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const result = await zaiAsyncResult(taskId);
-    if (result.task_status === 'SUCCESS') return result;
-    if (result.task_status === 'FAIL') throw new Error('비동기 작업 실패');
-    process.stdout.write(`${c.dim}  처리중... (${Math.floor((Date.now()-start)/1000)}초)${c.reset}\r`);
-    await new Promise(r => setTimeout(r, intervalMs));
-  }
-  throw new Error('폴링 타임아웃 (5분)');
+  const spin = createSpinner('처리중...').start();
+  try {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const result = await zaiAsyncResult(taskId);
+      if (result.task_status === 'SUCCESS') { spin.stop(); return result; }
+      if (result.task_status === 'FAIL') throw new Error('비동기 작업 실패');
+      await new Promise(r => setTimeout(r, intervalMs));
+    }
+    throw new Error('폴링 타임아웃 (5분)');
+  } catch (e) { spin.stop(); throw e; }
 }
 
 // ===== API: 음성 인식 =====
@@ -565,11 +1132,12 @@ run_with_approval로 실행 가능한 명령:
 파일을 읽을 때는 반드시 read_file 도구를 사용하세요. bash 명령어를 텍스트로 출력하지 마세요.
 최신 정보가 필요하면 web_search를 적극 활용하세요.
 
-중요 — 도구 사용 확인 규칙:
-- execute_command, write_file 을 바로 쓰지 말고, 먼저 사용자에게 실행할 명령/파일을 설명하고 확인을 받으세요.
-- 확인 없이 즉시 사용해도 되는 도구: read_file, web_search, web_read
-- 사용자가 명시적으로 "실행해", "해줘", "ㄱㄱ" 등으로 지시하면 바로 실행하세요.
-- 복잡하거나 위험한 작업은 run_with_approval을 사용하세요 (사용자에게 y/n 확인 프롬프트가 표시됩니다).
+중요 — 도구 사용 규칙:
+- execute_command, write_file은 시스템이 자동으로 사용자에게 승인을 요청합니다 (y/n/a 프롬프트).
+  따라서 이 도구들을 자유롭게 호출하세요 — 실행 전에 시스템이 확인합니다.
+- 확인 없이 즉시 실행되는 도구: read_file, web_search, web_read
+- 복잡한 다단계 작업은 run_with_approval을 사용하세요 (슬래시 명령 지원).
+- 가능하면 작업을 세분화하여 한 번에 하나씩 도구를 호출하세요.
 `;
 
     // MCP 도구 설명 추가
@@ -729,7 +1297,7 @@ async function executeSkill(name, input) {
   try {
     const response = await sendMessage(prompt);
     if (response && !CFG.stream) {
-      console.log(`${c.green}AI>${c.reset} ${response}\n`);
+      console.log(`${c.green}AI ▸${c.reset} ${response}\n`);
     } else if (response) {
       console.log('');
     }
@@ -760,7 +1328,7 @@ async function executeJsSkill(name, mod, input) {
         ? expandSkillTemplate(mod.prompt, input).replace(/\{\{result\}\}/g, text)
         : `[${name} 스킬 결과]\n${text}\n\n위 결과를 바탕으로 답변해주세요.`;
       const response = await sendMessage(aiPrompt);
-      if (response && !CFG.stream) console.log(`${c.green}AI>${c.reset} ${response}\n`);
+      if (response && !CFG.stream) console.log(`${c.green}AI ▸${c.reset} ${response}\n`);
       else if (response) console.log('');
     }
   } catch (e) {
@@ -827,7 +1395,7 @@ async function executePySkill(name, meta, input) {
         ? expandSkillTemplate(meta.prompt, typeof input === 'string' ? input : '').replace(/\{\{result\}\}/g, text)
         : `[${name} 스킬 결과]\n${text}\n\n위 결과를 바탕으로 답변해주세요.`;
       const response = await sendMessage(aiPrompt);
-      if (response && !CFG.stream) console.log(`${c.green}AI>${c.reset} ${response}\n`);
+      if (response && !CFG.stream) console.log(`${c.green}AI ▸${c.reset} ${response}\n`);
       else if (response) console.log('');
     }
   } catch (e) {
@@ -866,6 +1434,8 @@ function getScriptSkillTools() {
 }
 
 // ===== MCP 클라이언트 (HTTP + stdio) =====
+const MCP_TOOL_CACHE_FILE = path.join(CONFIG_DIR, 'mcp_tool_cache.json');
+
 function loadMcpConfig() {
   try {
     if (fs.existsSync(MCP_CONFIG_FILE)) return JSON.parse(fs.readFileSync(MCP_CONFIG_FILE, 'utf-8'));
@@ -876,6 +1446,24 @@ function loadMcpConfig() {
 function saveMcpConfig(config) {
   ensureDir(CONFIG_DIR);
   fs.writeFileSync(MCP_CONFIG_FILE, JSON.stringify(config, null, 2), 'utf-8');
+}
+
+// 도구 캐시: lazy 모드에서 연결 없이 도구 목록 제공
+function loadMcpToolCache() {
+  try {
+    if (fs.existsSync(MCP_TOOL_CACHE_FILE)) return JSON.parse(fs.readFileSync(MCP_TOOL_CACHE_FILE, 'utf-8'));
+  } catch (_) {}
+  return {};
+}
+
+function saveMcpToolCache(cache) {
+  try { ensureDir(CONFIG_DIR); fs.writeFileSync(MCP_TOOL_CACHE_FILE, JSON.stringify(cache, null, 2), 'utf-8'); } catch (_) {}
+}
+
+function mcpUpdateToolCache(name, tools) {
+  const cache = loadMcpToolCache();
+  cache[name] = { tools, updatedAt: new Date().toISOString() };
+  saveMcpToolCache(cache);
 }
 
 // 서버 설정에서 트랜스포트 타입 판별
@@ -1048,6 +1636,8 @@ async function mcpConnect(name, serverCfg) {
     const tools = toolsRes.result?.tools || [];
 
     mcpServers[name] = { transport: 'http', url, tools, sessionId, headers };
+    delete mcpLazy[name]; // lazy → connected
+    mcpUpdateToolCache(name, tools);
     debugLog(`MCP ${name}: ${tools.length}개 도구 발견`);
     return tools;
 
@@ -1071,6 +1661,8 @@ async function mcpConnect(name, serverCfg) {
     const tools = toolsRes.result?.tools || [];
 
     mcpServers[name] = { transport: 'stdio', stdio, tools, command: serverCfg.command };
+    delete mcpLazy[name]; // lazy → connected
+    mcpUpdateToolCache(name, tools);
     debugLog(`MCP ${name}: ${tools.length}개 도구 발견`);
     return tools;
 
@@ -1090,6 +1682,12 @@ async function mcpDisconnect(name) {
 }
 
 async function mcpCallTool(serverName, toolName, args) {
+  // lazy 서버: 첫 호출 시 자동 연결
+  if (!mcpServers[serverName] && mcpLazy[serverName]) {
+    debugLog(`MCP lazy 연결: ${serverName}`);
+    console.log(`  ${c.dim}MCP ${serverName} 연결중...${c.reset}`);
+    await mcpConnect(serverName, mcpLazy[serverName].config);
+  }
   const server = mcpServers[serverName];
   if (!server) throw new Error(`MCP 서버 없음: ${serverName}`);
 
@@ -1111,34 +1709,70 @@ async function mcpCallTool(serverName, toolName, args) {
   }
 }
 
-// MCP 도구를 OpenAI function calling 형식으로 변환
+// MCP 도구를 OpenAI function calling 형식으로 변환 (연결된 + lazy 서버 모두 포함)
 function getMcpFunctionTools() {
   const tools = [];
+  const seen = new Set();
+  // 1) 연결된 서버
   for (const [serverName, server] of Object.entries(mcpServers)) {
     for (const tool of server.tools) {
+      const fname = `mcp__${serverName}__${tool.name}`;
+      seen.add(fname);
       tools.push({
         type: 'function',
-        function: {
-          name: `mcp__${serverName}__${tool.name}`,
-          description: tool.description || '',
-          parameters: tool.inputSchema || { type: 'object', properties: {} },
-        },
+        function: { name: fname, description: tool.description || '', parameters: tool.inputSchema || { type: 'object', properties: {} } },
+      });
+    }
+  }
+  // 2) lazy 서버 (캐시된 도구 목록)
+  for (const [serverName, lazy] of Object.entries(mcpLazy)) {
+    for (const tool of lazy.tools) {
+      const fname = `mcp__${serverName}__${tool.name}`;
+      if (seen.has(fname)) continue;
+      tools.push({
+        type: 'function',
+        function: { name: fname, description: tool.description || '', parameters: tool.inputSchema || { type: 'object', properties: {} } },
       });
     }
   }
   return tools;
 }
 
-// 시작 시 설정된 MCP 서버에 자동 연결
+// 시작 시 MCP 서버 등록 (lazy: 캐시 사용, eager: 즉시 연결)
+// mcp.json의 서버별 "lazy": false 로 즉시 연결 강제 가능 (기본값: true)
 async function mcpAutoConnect() {
   const config = loadMcpConfig();
   const servers = config.servers || {};
+  const toolCache = loadMcpToolCache();
+
   for (const [name, cfg] of Object.entries(servers)) {
-    try {
-      const tools = await mcpConnect(name, cfg);
-      console.log(`  ${c.green}MCP${c.reset} ${name}: ${tools.length}개 도구 연결됨`);
-    } catch (e) {
-      console.log(`  ${c.red}MCP${c.reset} ${name}: 연결 실패 - ${e.message}`);
+    const isLazy = cfg.lazy !== false; // 기본값: lazy
+
+    if (isLazy) {
+      // lazy: 캐시에서 도구 목록 로드 (연결 안함)
+      const cached = toolCache[name];
+      if (cached && cached.tools && cached.tools.length > 0) {
+        mcpLazy[name] = { config: cfg, tools: cached.tools };
+        console.log(`  ${c.blue}◇${c.reset} MCP ${c.bold}${name}${c.reset}: ${cached.tools.length}개 도구 ${c.dim}(lazy, 캐시)${c.reset}`);
+      } else {
+        // 캐시 없음 → 첫 연결 필요 (도구 목록 확보)
+        try {
+          const tools = await mcpConnect(name, cfg);
+          console.log(`  ${c.green}✓${c.reset} MCP ${c.bold}${name}${c.reset}: ${tools.length}개 도구 연결됨 ${c.dim}(캐시 생성)${c.reset}`);
+        } catch (e) {
+          // 연결 실패해도 lazy로 등록 (도구 없이)
+          mcpLazy[name] = { config: cfg, tools: [] };
+          console.log(`  ${c.yellow}△${c.reset} MCP ${name}: 캐시 없음, 첫 호출 시 연결 ${c.dim}(${e.message})${c.reset}`);
+        }
+      }
+    } else {
+      // eager: 즉시 연결
+      try {
+        const tools = await mcpConnect(name, cfg);
+        console.log(`  ${c.green}✓${c.reset} MCP ${c.bold}${name}${c.reset}: ${tools.length}개 도구 연결됨`);
+      } catch (e) {
+        console.log(`  ${c.red}✗${c.reset} MCP ${name}: 연결 실패 - ${e.message}`);
+      }
     }
   }
 }
@@ -1195,36 +1829,34 @@ async function dispatchCommand(cmdStr) {
       let prompt = arg, size = null;
       const sizeMatch = arg.match(/--size\s+(\S+)/);
       if (sizeMatch) { size = sizeMatch[1]; prompt = arg.replace(/--size\s+\S+/, '').trim(); }
-      process.stdout.write(`${c.dim}  이미지 생성중...${c.reset}`);
+      const imgSpin = createSpinner('이미지 생성중...').start();
       const res = await zaiGenerateImage(prompt, { size });
-      process.stdout.write('\r\x1b[K');
+      imgSpin.stop();
       const url = res.data?.[0]?.url;
       if (url) {
-        console.log(`  ${c.green}완료${c.reset}: ${c.cyan}${url}${c.reset}`);
+        console.log(`  ${c.green}✓${c.reset} 완료: ${c.cyan}${url}${c.reset}`);
         return { success: true, type: 'image', url };
       }
       return { success: false, error: '이미지 URL 없음' };
     }
     case 'video': case 'vid': {
-      process.stdout.write(`${c.dim}  비디오 생성 요청중...${c.reset}`);
+      const vidSpin = createSpinner('비디오 생성 요청중...').start();
       const res = await zaiGenerateVideo(arg);
-      process.stdout.write('\r\x1b[K');
       const taskId = res.id;
-      if (!taskId) return { success: false, error: '작업 ID 없음' };
-      console.log(`  작업 ID: ${c.cyan}${taskId}${c.reset}`);
+      if (!taskId) { vidSpin.fail('작업 ID 없음'); return { success: false, error: '작업 ID 없음' }; }
+      vidSpin.succeed(`작업 ID: ${c.cyan}${taskId}${c.reset}`);
       const result = await zaiPollResult(taskId);
-      process.stdout.write('\r\x1b[K');
       const videos = result.video_result || [];
       if (videos.length) {
-        for (const v of videos) console.log(`  ${c.green}완료${c.reset}: ${c.cyan}${v.url}${c.reset}`);
+        for (const v of videos) console.log(`  ${c.green}✓${c.reset} 완료: ${c.cyan}${v.url}${c.reset}`);
         return { success: true, type: 'video', videos: videos.map(v => v.url) };
       }
       return { success: false, error: '비디오 결과 없음' };
     }
     case 'ocr': {
-      process.stdout.write(`${c.dim}  OCR 처리중...${c.reset}`);
+      const ocrSpin = createSpinner('OCR 처리중...').start();
       const res = await zaiLayoutParsing(arg);
-      process.stdout.write('\r\x1b[K');
+      ocrSpin.stop();
       return { success: true, type: 'ocr', output: res.md_results || '', regions: res.layout_details?.length || 0 };
     }
     case 'embed': {
@@ -1233,16 +1865,15 @@ async function dispatchCommand(cmdStr) {
       return { success: true, type: 'embed', dimensions: emb?.length, preview: emb?.slice(0, 5) };
     }
     case 'upload': {
-      process.stdout.write(`${c.dim}  업로드중...${c.reset}`);
+      const uplSpin = createSpinner('업로드중...').start();
       const res = await zaiUploadFile(arg);
-      process.stdout.write('\r\x1b[K');
-      console.log(`  ${c.green}완료${c.reset}: ID ${c.cyan}${res.id}${c.reset}`);
+      uplSpin.succeed(`완료: ID ${c.cyan}${res.id}${c.reset}`);
       return { success: true, type: 'upload', id: res.id, filename: res.filename };
     }
     case 'transcribe': case 'asr': {
-      process.stdout.write(`${c.dim}  음성 인식중...${c.reset}`);
+      const asrSpin = createSpinner('음성 인식중...').start();
       const res = await zaiTranscribeAudio(arg);
-      process.stdout.write('\r\x1b[K');
+      asrSpin.stop();
       const text = res.text || res.choices?.[0]?.message?.content || JSON.stringify(res);
       return { success: true, type: 'transcribe', output: text };
     }
@@ -1297,9 +1928,51 @@ const FUNCTION_TOOLS = [
   }},
 ];
 
+// ===== 도구 승인 =====
+// 위험 도구(execute_command, write_file)는 실행 전 사용자 확인 필요
+const DANGEROUS_TOOLS = new Set(['execute_command', 'write_file']);
+
+async function requireToolApproval(toolName, args) {
+  // 자동 승인 모드
+  if (CFG.autoApprove) return true;
+  // 세션 중 항상 허용한 도구
+  if (toolApproveSession.has(toolName)) return true;
+  // 안전한 도구는 즉시 허용
+  if (!DANGEROUS_TOOLS.has(toolName)) return true;
+
+  // 실행 내용 미리보기
+  if (toolName === 'execute_command') {
+    console.log(`\n  ${c.yellow}⚠ 명령 실행 요청${c.reset}`);
+    console.log(`    ${c.cyan}$ ${args.command}${c.reset}`);
+  } else if (toolName === 'write_file') {
+    const preview = (args.content || '').slice(0, 200);
+    const lines = (args.content || '').split('\n').length;
+    console.log(`\n  ${c.yellow}⚠ 파일 쓰기 요청${c.reset}`);
+    console.log(`    ${c.cyan}${args.path}${c.reset} ${c.dim}(${lines}줄, ${Buffer.byteLength(args.content || '')}B)${c.reset}`);
+    console.log(`    ${c.dim}${preview}${preview.length < (args.content || '').length ? '...' : ''}${c.reset}`);
+  }
+
+  const answer = await promptUser(`    허용? (${c.green}y${c.reset}/${c.red}n${c.reset}/${c.blue}a${c.reset}=항상) `);
+  if (answer === 'a' || answer === 'always' || answer === 'ㅁ') {
+    toolApproveSession.add(toolName);
+    console.log(`  ${c.blue}✓${c.reset} ${toolName} 세션 중 자동 승인`);
+    return true;
+  }
+  if (answer === 'y' || answer === 'yes' || answer === 'ㅛ') return true;
+  console.log(`  ${c.dim}거부됨${c.reset}`);
+  return false;
+}
+
 // ===== 도구 실행 =====
 async function executeTool(toolName, args) {
-  console.log(`${c.magenta}[도구]${c.reset} ${toolName} ${c.dim}${JSON.stringify(args).slice(0,80)}${c.reset}`);
+  console.log(`\n  ${c.magenta}◆${c.reset} ${c.bold}${toolName}${c.reset} ${c.dim}${JSON.stringify(args).slice(0,80)}${c.reset}`);
+  // 위험 도구: 사용자 승인 필요
+  const approved = await requireToolApproval(toolName, args);
+  if (!approved) {
+    console.log(`    ${c.red}✗ 거부됨${c.reset}`);
+    return { success: false, denied: true, message: '사용자가 실행을 거부했습니다' };
+  }
+
   let result;
   switch (toolName) {
     case 'read_file': {
@@ -1348,9 +2021,9 @@ async function executeTool(toolName, args) {
       break;
     }
     case 'run_with_approval': {
-      console.log(`\n${c.yellow}[AI 실행 요청]${c.reset} ${args.description}`);
-      console.log(`  ${c.cyan}${args.command}${c.reset}`);
-      const answer = await promptUser(`  실행할까요? (${c.green}y${c.reset}/${c.red}n${c.reset}) `);
+      console.log(`\n  ${c.yellow}⚠${c.reset} ${c.bold}실행 요청${c.reset} ${args.description}`);
+      console.log(`    ${c.cyan}${args.command}${c.reset}`);
+      const answer = await promptUser(`    실행할까요? (${c.green}y${c.reset}/${c.red}n${c.reset}) `);
       if (answer === 'y' || answer === 'yes' || answer === 'ㅛ') {
         try {
           result = await dispatchCommand(args.command);
@@ -1408,7 +2081,7 @@ async function executeTool(toolName, args) {
       }
     }
   }
-  console.log(`  ${result.success !== false ? c.green + '성공' : c.red + '실패'}${c.reset}`);
+  console.log(`    ${result.success !== false ? c.green + '✓ 완료' : c.red + '✗ 실패'}${c.reset}`);
   return result;
 }
 
@@ -1432,9 +2105,9 @@ async function sendMessage(userMessage) {
 }
 
 async function sendMessageSync(startTime) {
-  process.stdout.write(`${c.dim}[처리중...]${c.reset}`);
+  const spin = createSpinner('응답 대기중...').start();
   let res = await zaiChat(conversationHistory);
-  process.stdout.write('\r\x1b[K');
+  spin.stop();
 
   // 웹 검색 결과 표시
   if (res.web_search?.length) printSearchResults(res.web_search);
@@ -1459,8 +2132,9 @@ async function sendMessageSync(startTime) {
 
   const content = msg?.content || '';
   const reasoning = msg?.reasoning_content || '';
-  if (reasoning) console.log(`${c.dim}[생각] ${reasoning}${c.reset}\n`);
+  if (reasoning) console.log(`\n  ${c.dim}${c.italic}◇ ${reasoning}${c.reset}\n`);
   conversationHistory.push({ role: 'assistant', content });
+  renderHud(Date.now() - startTime);
   debugLog(`응답 시간: ${((Date.now()-startTime)/1000).toFixed(2)}초`);
   return content;
 }
@@ -1471,16 +2145,16 @@ async function sendMessageStream(startTime) {
 
   const result = await zaiChatStream(conversationHistory, {
     onReasoning(token) {
-      if (!isReasoning) { process.stdout.write(`${c.dim}[생각] `); isReasoning = true; }
+      if (!isReasoning) { process.stdout.write(`\n  ${c.dim}${c.italic}◇ `); isReasoning = true; }
       process.stdout.write(token);
     },
     onToken(token) {
       if (isReasoning) { process.stdout.write(`${c.reset}\n\n`); isReasoning = false; }
-      if (isFirstToken) { process.stdout.write(`${c.green}AI>${c.reset} `); isFirstToken = false; }
+      if (isFirstToken) { process.stdout.write(`${c.green}AI ▸${c.reset} `); isFirstToken = false; }
       process.stdout.write(token);
     },
     onSearchResult(results) { printSearchResults(results); },
-    onUsage(u) { lastUsage = u; },
+    onUsage(u) { trackUsage(u); },
   });
 
   if (isReasoning) process.stdout.write(c.reset);
@@ -1504,31 +2178,32 @@ async function sendMessageStream(startTime) {
     isReasoning = false;
     current = await zaiChatStream(conversationHistory, {
       onReasoning(token) {
-        if (!isReasoning) { process.stdout.write(`${c.dim}[생각] `); isReasoning = true; }
+        if (!isReasoning) { process.stdout.write(`\n  ${c.dim}${c.italic}◇ `); isReasoning = true; }
         process.stdout.write(token);
       },
       onToken(token) {
         if (isReasoning) { process.stdout.write(`${c.reset}\n\n`); isReasoning = false; }
-        if (isFirstToken) { process.stdout.write(`${c.green}AI>${c.reset} `); isFirstToken = false; }
+        if (isFirstToken) { process.stdout.write(`${c.green}AI ▸${c.reset} `); isFirstToken = false; }
         process.stdout.write(token);
       },
       onSearchResult(results) { printSearchResults(results); },
-      onUsage(u) { lastUsage = u; },
+      onUsage(u) { trackUsage(u); },
     });
     if (isReasoning) process.stdout.write(c.reset);
     if (!isFirstToken) process.stdout.write('\n');
   }
 
   conversationHistory.push({ role: 'assistant', content: current.content || '' });
+  renderHud(Date.now() - startTime);
   debugLog(`응답 시간: ${((Date.now()-startTime)/1000).toFixed(2)}초`);
   return current.content;
 }
 
 function printSearchResults(results) {
   if (!results?.length) return;
-  console.log(`${c.blue}[웹 검색 참조]${c.reset}`);
+  console.log(`\n  ${c.blue}◇ 웹 검색 참조${c.reset}`);
   for (const r of results.slice(0, 5)) {
-    console.log(`  ${c.dim}${r.title || ''}${c.reset} ${c.blue}${r.link || ''}${c.reset}`);
+    console.log(`    ${c.dim}▸${c.reset} ${r.title || ''} ${c.blue}${r.link || ''}${c.reset}`);
   }
   console.log('');
 }
@@ -1568,42 +2243,86 @@ async function handleSlashCommand(input, rl) {
 
     case 'model': case 'm':
       if (!arg) {
-        console.log(`\n${c.bold}사용 가능한 모델:${c.reset}`);
+        console.log(`\n  ${c.bold}사용 가능한 모델${c.reset}\n`);
         for (const [name, desc] of Object.entries(MODELS)) {
-          const marker = name === CFG.model ? ` ${c.green}<- 현재${c.reset}` : '';
-          console.log(`  ${c.cyan}${name.padEnd(24)}${c.reset} ${desc}${marker}`);
+          const current = name === CFG.model;
+          const marker = current ? ` ${c.green}● 현재${c.reset}` : '';
+          console.log(`  ${current ? c.green : c.cyan}${name.padEnd(24)}${c.reset} ${c.dim}${desc}${c.reset}${marker}`);
         }
-        console.log(`\n  사용법: /model <이름>\n`);
+        console.log(`\n  ${c.dim}사용법: /model <이름>${c.reset}\n`);
       } else {
         CFG.model = arg;
-        console.log(`${c.green}모델 변경: ${arg}${c.reset}\n`);
+        console.log(`  ${c.green}✓${c.reset} 모델 변경: ${c.cyan}${arg}${c.reset}\n`);
       }
       break;
 
     case 'stream':
       CFG.stream = !CFG.stream;
-      console.log(`스트리밍: ${CFG.stream ? c.green + 'ON' : c.red + 'OFF'}${c.reset}\n`);
+      console.log(`  스트리밍  ${onoff(CFG.stream)}\n`);
       break;
 
     case 'think':
       CFG.think = !CFG.think;
-      console.log(`사고 모드: ${CFG.think ? c.green + 'ON' : c.red + 'OFF'}${c.reset}\n`);
+      console.log(`  사고 모드 ${onoff(CFG.think)}\n`);
       break;
 
     case 'tools':
       CFG.tools = !CFG.tools;
-      console.log(`도구 호출: ${CFG.tools ? c.green + 'ON' : c.red + 'OFF'}${c.reset}\n`);
+      console.log(`  도구 호출 ${onoff(CFG.tools)}\n`);
       break;
 
     case 'websearch': case 'ws':
       CFG.webSearch = !CFG.webSearch;
-      console.log(`웹 검색: ${CFG.webSearch ? c.green + 'ON' : c.red + 'OFF'}${c.reset}\n`);
+      console.log(`  웹 검색   ${onoff(CFG.webSearch)}\n`);
       break;
 
     case 'json':
       CFG.jsonMode = !CFG.jsonMode;
-      console.log(`JSON 모드: ${CFG.jsonMode ? c.green + 'ON' : c.red + 'OFF'}${c.reset}\n`);
+      console.log(`  JSON 모드 ${onoff(CFG.jsonMode)}\n`);
       break;
+
+    case 'hud':
+      hudEnabled = !hudEnabled;
+      console.log(`  사용량 HUD ${onoff(hudEnabled)}\n`);
+      if (hudEnabled && lastUsage) renderHud();
+      break;
+
+    case 'approve':
+      CFG.autoApprove = !CFG.autoApprove;
+      toolApproveSession.clear();
+      console.log(`  도구 자동 승인 ${onoff(CFG.autoApprove)} ${CFG.autoApprove ? c.yellow + '(execute_command, write_file 확인 생략)' + c.reset : c.dim + '(실행 전 확인)' + c.reset}\n`);
+      break;
+
+    case 'usage': {
+      const su = sessionUsage;
+      console.log(`\n  ${c.bold}사용량${c.reset}`);
+      console.log(`  ${c.dim}${'─'.repeat(42)}${c.reset}`);
+      console.log(`  ${c.cyan}◆ 현재 세션${c.reset}`);
+      console.log(`    요청 ${c.bold}${su.requests}${c.reset}회  |  입력 ${fmtTokens(su.promptTokens)}  출력 ${fmtTokens(su.completionTokens)}  합계 ${c.bold}${fmtTokens(su.totalTokens)}${c.reset}`);
+      if (lastUsage) {
+        console.log(`    ${c.dim}마지막: 입력 ${fmtTokens(lastUsage.prompt_tokens)} + 출력 ${fmtTokens(lastUsage.completion_tokens)} = ${fmtTokens(lastUsage.total_tokens)}${c.reset}`);
+      }
+      console.log('');
+      console.log(`  ${c.cyan}◆ 구간별 사용량${c.reset}`);
+      for (const [key, ms] of Object.entries(QUOTA_WINDOWS)) {
+        const wu = getWindowUsage(ms);
+        const limit = quotaLimits[key];
+        const bar = limit ? '  ' + quotaBar(wu.totalTokens, limit) : '';
+        console.log(`    ${windowLabel(key).padEnd(6)} ${c.bold}${fmtTokens(wu.totalTokens).padStart(6)}${c.reset} 토큰  ${c.dim}(${wu.requests}회)${c.reset}${bar}`);
+      }
+      console.log('');
+      break;
+    }
+
+    case 'quota': {
+      await cmdQuota(arg);
+      break;
+    }
+
+    case 'account': case 'acc': {
+      await cmdAccount();
+      break;
+    }
 
     case 'search': case 's':
       if (!arg) { console.log(`  사용법: /search <검색어>\n`); break; }
@@ -1716,50 +2435,50 @@ async function handleSlashCommand(input, rl) {
 
 // ===== 명령어 구현 =====
 async function cmdSearchDDG(query) {
+  const spin = createSpinner('DuckDuckGo 검색중...').start();
   try {
-    process.stdout.write(`${c.dim}DuckDuckGo 검색중...${c.reset}`);
     const res = await duckDuckGoSearch(query);
-    process.stdout.write('\r\x1b[K');
-    if (!res.results.length) { console.log(`${c.yellow}검색 결과 없음${c.reset}\n`); return; }
-    console.log(`${c.bold}검색 결과: "${query}"${c.reset} (${res.count}건)\n`);
+    spin.stop();
+    if (!res.results.length) { console.log(`  ${c.yellow}검색 결과 없음${c.reset}\n`); return; }
+    console.log(`  ${c.bold}검색: "${query}"${c.reset} ${c.dim}(${res.count}건)${c.reset}\n`);
     for (const r of res.results.slice(0, 10)) {
-      console.log(`  ${c.cyan}${r.title}${c.reset}`);
-      if (r.snippet) console.log(`  ${c.dim}${r.snippet.slice(0, 150)}${c.reset}`);
-      if (r.url) console.log(`  ${c.blue}${r.url}${c.reset}`);
+      console.log(`  ${c.cyan}▸${c.reset} ${c.bold}${r.title}${c.reset}`);
+      if (r.snippet) console.log(`    ${c.dim}${r.snippet.slice(0, 150)}${c.reset}`);
+      if (r.url) console.log(`    ${c.blue}${r.url}${c.reset}`);
       console.log('');
     }
-  } catch (e) { console.error(`${c.red}검색 실패: ${e.message}${c.reset}\n`); }
+  } catch (e) { spin.fail(`검색 실패: ${e.message}`); }
 }
 
 async function cmdSearchZai(query) {
+  const spin = createSpinner('검색중 (search-prime)...').start();
   try {
-    process.stdout.write(`${c.dim}검색중 (search-prime)...${c.reset}`);
     const res = await zaiWebSearch(query);
-    process.stdout.write('\r\x1b[K');
+    spin.stop();
     const results = res.search_result || [];
-    if (!results.length) { console.log(`${c.yellow}검색 결과 없음${c.reset}\n`); return; }
-    console.log(`${c.bold}검색: "${query}"${c.reset} (${results.length}건)\n`);
+    if (!results.length) { console.log(`  ${c.yellow}검색 결과 없음${c.reset}\n`); return; }
+    console.log(`  ${c.bold}검색: "${query}"${c.reset} ${c.dim}(${results.length}건)${c.reset}\n`);
     for (const r of results.slice(0, 10)) {
-      console.log(`  ${c.cyan}${r.title}${c.reset}`);
-      if (r.content) console.log(`  ${c.dim}${r.content.slice(0, 150)}${c.reset}`);
-      if (r.link) console.log(`  ${c.blue}${r.link}${c.reset}`);
+      console.log(`  ${c.cyan}▸${c.reset} ${c.bold}${r.title}${c.reset}`);
+      if (r.content) console.log(`    ${c.dim}${r.content.slice(0, 150)}${c.reset}`);
+      if (r.link) console.log(`    ${c.blue}${r.link}${c.reset}`);
       console.log('');
     }
-  } catch (e) { console.error(`${c.red}검색 실패: ${e.message}${c.reset}\n`); }
+  } catch (e) { spin.fail(`검색 실패: ${e.message}`); }
 }
 
 async function cmdRead(url) {
+  const spin = createSpinner('읽는중...').start();
   try {
-    process.stdout.write(`${c.dim}읽는중...${c.reset}`);
     const res = await zaiWebRead(url);
-    process.stdout.write('\r\x1b[K');
+    spin.stop();
     const r = res.reader_result || res;
-    if (r.title) console.log(`${c.bold}${r.title}${c.reset}\n`);
+    if (r.title) console.log(`  ${c.bold}${r.title}${c.reset}\n`);
     console.log(truncate(r.content || '내용 없음', 5000));
     console.log('');
     // 대화 히스토리에 추가
     conversationHistory.push({ role: 'user', content: `[URL 읽기 결과: ${url}]\n${truncate(r.content || '', 10000)}` });
-  } catch (e) { console.error(`${c.red}읽기 실패: ${e.message}${c.reset}\n`); }
+  } catch (e) { spin.fail(`읽기 실패: ${e.message}`); }
 }
 
 async function cmdImage(input) {
@@ -1767,19 +2486,18 @@ async function cmdImage(input) {
   const sizeMatch = input.match(/--size\s+(\S+)/);
   if (sizeMatch) { size = sizeMatch[1]; prompt = input.replace(/--size\s+\S+/, '').trim(); }
 
+  const spin = createSpinner('이미지 생성중...').start();
   try {
-    process.stdout.write(`${c.dim}이미지 생성중...${c.reset}`);
     const res = await zaiGenerateImage(prompt, { size });
-    process.stdout.write('\r\x1b[K');
     const url = res.data?.[0]?.url;
     if (url) {
-      console.log(`${c.green}이미지 생성 완료${c.reset}`);
-      console.log(`  ${c.cyan}${url}${c.reset}`);
-      console.log(`  ${c.dim}(30일 후 만료)${c.reset}\n`);
+      spin.succeed('이미지 생성 완료');
+      console.log(`    ${c.cyan}${url}${c.reset}`);
+      console.log(`    ${c.dim}(30일 후 만료)${c.reset}\n`);
     } else {
-      console.log(`${c.yellow}이미지 URL을 받지 못했습니다${c.reset}\n`);
+      spin.fail('이미지 URL을 받지 못했습니다');
     }
-  } catch (e) { console.error(`${c.red}이미지 생성 실패: ${e.message}${c.reset}\n`); }
+  } catch (e) { spin.fail(`이미지 생성 실패: ${e.message}`); }
 }
 
 async function cmdVideo(input) {
@@ -1788,27 +2506,25 @@ async function cmdVideo(input) {
   if (input.match(/--duration\s+(\d+)/)) { opts.duration = parseInt(RegExp.$1); prompt = prompt.replace(/--duration\s+\d+/, '').trim(); }
   if (input.match(/--fps\s+(\d+)/)) { opts.fps = parseInt(RegExp.$1); prompt = prompt.replace(/--fps\s+\d+/, '').trim(); }
 
+  const spin = createSpinner('비디오 생성 요청중...').start();
   try {
-    console.log(`${c.dim}비디오 생성 요청중...${c.reset}`);
     const res = await zaiGenerateVideo(prompt, opts);
     const taskId = res.id;
-    if (!taskId) { console.log(`${c.yellow}작업 ID를 받지 못했습니다${c.reset}\n`); return; }
-    console.log(`  작업 ID: ${c.cyan}${taskId}${c.reset}`);
-    console.log(`${c.dim}폴링중... (최대 5분)${c.reset}`);
+    if (!taskId) { spin.fail('작업 ID를 받지 못했습니다'); return; }
+    spin.succeed(`작업 ID: ${c.cyan}${taskId}${c.reset}`);
     const result = await zaiPollResult(taskId);
-    process.stdout.write('\r\x1b[K');
     const videos = result.video_result || [];
     if (videos.length) {
-      console.log(`${c.green}비디오 생성 완료${c.reset}`);
+      console.log(`  ${c.green}✓${c.reset} 비디오 생성 완료`);
       for (const v of videos) {
-        console.log(`  ${c.cyan}${v.url}${c.reset}`);
-        if (v.cover_image_url) console.log(`  커버: ${c.dim}${v.cover_image_url}${c.reset}`);
+        console.log(`    ${c.cyan}${v.url}${c.reset}`);
+        if (v.cover_image_url) console.log(`    커버: ${c.dim}${v.cover_image_url}${c.reset}`);
       }
     } else {
-      console.log(`${c.yellow}비디오 결과 없음${c.reset}`);
+      console.log(`  ${c.yellow}비디오 결과 없음${c.reset}`);
     }
     console.log('');
-  } catch (e) { console.error(`\n${c.red}비디오 생성 실패: ${e.message}${c.reset}\n`); }
+  } catch (e) { spin.fail(`비디오 생성 실패: ${e.message}`); }
 }
 
 async function cmdPoll(taskId) {
@@ -1823,82 +2539,81 @@ async function cmdPoll(taskId) {
 }
 
 async function cmdOcr(fileUrl) {
+  const spin = createSpinner('OCR 처리중...').start();
   try {
-    process.stdout.write(`${c.dim}OCR 처리중...${c.reset}`);
     const res = await zaiLayoutParsing(fileUrl);
-    process.stdout.write('\r\x1b[K');
+    spin.succeed('OCR 완료');
     if (res.md_results) {
-      console.log(`${c.bold}OCR 결과:${c.reset}\n`);
+      console.log(`\n${c.bold}OCR 결과:${c.reset}\n`);
       console.log(truncate(res.md_results, 5000));
     }
     if (res.layout_details?.length) {
-      console.log(`\n${c.dim}레이아웃: ${res.layout_details.length}개 영역 감지${c.reset}`);
+      console.log(`\n  ${c.dim}레이아웃: ${res.layout_details.length}개 영역 감지${c.reset}`);
     }
-    if (res.usage) console.log(`${c.dim}토큰: ${res.usage.total_tokens}${c.reset}`);
+    if (res.usage) console.log(`  ${c.dim}토큰: ${res.usage.total_tokens}${c.reset}`);
     console.log('');
-  } catch (e) { console.error(`${c.red}OCR 실패: ${e.message}${c.reset}\n`); }
+  } catch (e) { spin.fail(`OCR 실패: ${e.message}`); }
 }
 
 async function cmdEmbed(text) {
+  const spin = createSpinner('임베딩 생성중...').start();
   try {
-    process.stdout.write(`${c.dim}임베딩 생성중...${c.reset}`);
     const res = await zaiEmbed(text);
-    process.stdout.write('\r\x1b[K');
+    spin.succeed('임베딩 완료');
     const data = res.data;
     if (data?.length) {
       const emb = data[0].embedding;
-      console.log(`${c.bold}임베딩 결과${c.reset}`);
-      console.log(`  차원: ${emb.length}`);
-      console.log(`  처음 10개: [${emb.slice(0, 10).map(v => v.toFixed(6)).join(', ')}...]`);
-      if (res.usage) console.log(`  토큰: ${res.usage.total_tokens}`);
+      console.log(`    차원: ${emb.length}`);
+      console.log(`    처음 10개: [${emb.slice(0, 10).map(v => v.toFixed(6)).join(', ')}...]`);
+      if (res.usage) console.log(`    토큰: ${res.usage.total_tokens}`);
     }
     console.log('');
-  } catch (e) { console.error(`${c.red}임베딩 실패: ${e.message}${c.reset}\n`); }
+  } catch (e) { spin.fail(`임베딩 실패: ${e.message}`); }
 }
 
 async function cmdTokens() {
-  if (conversationHistory.length <= 1) { console.log(`${c.yellow}대화 기록이 비어있습니다${c.reset}\n`); return; }
+  if (conversationHistory.length <= 1) { console.log(`  ${c.yellow}대화 기록이 비어있습니다${c.reset}\n`); return; }
+  const spin = createSpinner('토큰 계산중...').start();
   try {
-    process.stdout.write(`${c.dim}토큰 계산중...${c.reset}`);
     const res = await zaiTokenize(conversationHistory);
-    process.stdout.write('\r\x1b[K');
+    spin.succeed('토큰 계산 완료');
     const u = res.usage || {};
-    console.log(`${c.bold}토큰 사용량${c.reset}`);
-    if (u.prompt_tokens) console.log(`  프롬프트: ${u.prompt_tokens}`);
-    if (u.image_tokens) console.log(`  이미지: ${u.image_tokens}`);
-    if (u.video_tokens) console.log(`  비디오: ${u.video_tokens}`);
-    console.log(`  합계: ${u.total_tokens || '?'}`);
+    if (u.prompt_tokens) console.log(`    프롬프트: ${u.prompt_tokens}`);
+    if (u.image_tokens) console.log(`    이미지: ${u.image_tokens}`);
+    if (u.video_tokens) console.log(`    비디오: ${u.video_tokens}`);
+    console.log(`    합계: ${c.bold}${u.total_tokens || '?'}${c.reset}`);
     console.log('');
-  } catch (e) { console.error(`${c.red}토큰 계산 실패: ${e.message}${c.reset}\n`); }
+  } catch (e) { spin.fail(`토큰 계산 실패: ${e.message}`); }
 }
 
 async function cmdUpload(filePath) {
   const fullPath = path.resolve(CFG.workspace, filePath);
-  if (!fs.existsSync(fullPath)) { console.log(`${c.red}파일 없음: ${fullPath}${c.reset}\n`); return; }
+  if (!fs.existsSync(fullPath)) { console.log(`  ${c.red}✗${c.reset} 파일 없음: ${fullPath}\n`); return; }
+  const stat = fs.statSync(fullPath);
+  const spin = createSpinner(`업로드중... (${formatBytes(stat.size)})`).start();
   try {
-    const stat = fs.statSync(fullPath);
-    console.log(`${c.dim}업로드중... (${formatBytes(stat.size)})${c.reset}`);
     const res = await zaiUploadFile(filePath);
-    console.log(`${c.green}업로드 완료${c.reset}`);
-    console.log(`  ID: ${c.cyan}${res.id}${c.reset}`);
-    console.log(`  파일: ${res.filename} (${formatBytes(res.bytes)})`);
+    spin.succeed('업로드 완료');
+    console.log(`    ID: ${c.cyan}${res.id}${c.reset}`);
+    console.log(`    파일: ${res.filename} (${formatBytes(res.bytes)})`);
     console.log('');
-  } catch (e) { console.error(`${c.red}업로드 실패: ${e.message}${c.reset}\n`); }
+  } catch (e) { spin.fail(`업로드 실패: ${e.message}`); }
 }
 
 async function cmdTranscribe(filePath) {
   const fullPath = path.resolve(CFG.workspace, filePath);
-  if (!fs.existsSync(fullPath)) { console.log(`${c.red}파일 없음: ${fullPath}${c.reset}\n`); return; }
+  if (!fs.existsSync(fullPath)) { console.log(`  ${c.red}✗${c.reset} 파일 없음: ${fullPath}\n`); return; }
+  const stat = fs.statSync(fullPath);
+  const spin = createSpinner(`음성 인식중... (${formatBytes(stat.size)})`).start();
   try {
-    const stat = fs.statSync(fullPath);
-    console.log(`${c.dim}음성 인식중... (${formatBytes(stat.size)})${c.reset}`);
     const res = await zaiTranscribeAudio(filePath);
-    console.log(`${c.bold}음성 인식 결과:${c.reset}\n`);
+    spin.succeed('음성 인식 완료');
+    console.log('');
     if (res.text) console.log(res.text);
     else if (res.choices?.[0]?.message?.content) console.log(res.choices[0].message.content);
     else console.log(JSON.stringify(res, null, 2));
     console.log('');
-  } catch (e) { console.error(`${c.red}음성 인식 실패: ${e.message}${c.reset}\n`); }
+  } catch (e) { spin.fail(`음성 인식 실패: ${e.message}`); }
 }
 
 function cmdSave(name) {
@@ -2030,57 +2745,239 @@ function cmdPop() {
   console.log(`${c.green}마지막 대화 쌍 제거 (${removed}개)${c.reset}\n`);
 }
 
+// ===== 쿼터 명령어 =====
+async function cmdQuota(arg) {
+  const parts = arg ? arg.split(/\s+/) : [];
+  const sub = parts[0] || '';
+
+  switch (sub) {
+    case '':
+    case 'show': {
+      console.log(`\n  ${c.bold}쿼터 설정${c.reset}`);
+      console.log(`  ${c.dim}${'─'.repeat(42)}${c.reset}`);
+      for (const [key, ms] of Object.entries(QUOTA_WINDOWS)) {
+        const limit = quotaLimits[key];
+        const wu = getWindowUsage(ms);
+        if (limit) {
+          console.log(`  ${windowLabel(key).padEnd(6)} ${quotaBar(wu.totalTokens, limit)}  ${c.dim}(${fmtTokens(wu.totalTokens)} / ${fmtTokens(limit)})${c.reset}`);
+        } else {
+          console.log(`  ${windowLabel(key).padEnd(6)} ${c.dim}제한 없음${c.reset}  ${c.dim}(현재 ${fmtTokens(wu.totalTokens)})${c.reset}`);
+        }
+      }
+      console.log(`\n  ${c.dim}설정: /quota set <5h|daily|weekly> <토큰수>${c.reset}`);
+      console.log(`  ${c.dim}해제: /quota off <5h|daily|weekly>${c.reset}`);
+      console.log(`  ${c.dim}초기화: /quota reset${c.reset}\n`);
+      break;
+    }
+    case 'set': {
+      const key = parts[1];
+      const val = parts[2];
+      if (!key || !val || !QUOTA_WINDOWS[key]) {
+        console.log(`  ${c.yellow}사용법: /quota set <5h|daily|weekly> <토큰수>${c.reset}`);
+        console.log(`  ${c.dim}예: /quota set 5h 100000  (5시간 10만 토큰)${c.reset}`);
+        console.log(`  ${c.dim}    /quota set weekly 1000000  (주간 100만 토큰)${c.reset}\n`);
+        break;
+      }
+      let num = parseInt(val);
+      // K/M 단위 지원
+      if (val.toLowerCase().endsWith('k')) num = parseInt(val) * 1000;
+      else if (val.toLowerCase().endsWith('m')) num = parseInt(val) * 1000000;
+      if (isNaN(num) || num <= 0) {
+        console.log(`  ${c.red}✗${c.reset} 유효한 숫자를 입력하세요\n`);
+        break;
+      }
+      quotaLimits[key] = num;
+      saveQuota(quotaLimits);
+      console.log(`  ${c.green}✓${c.reset} ${windowLabel(key)} 쿼터: ${c.bold}${fmtTokens(num)}${c.reset} 토큰\n`);
+      break;
+    }
+    case 'off': case 'clear': {
+      const key = parts[1];
+      if (!key || !QUOTA_WINDOWS[key]) {
+        console.log(`  ${c.yellow}사용법: /quota off <5h|daily|weekly>${c.reset}\n`);
+        break;
+      }
+      quotaLimits[key] = 0;
+      saveQuota(quotaLimits);
+      console.log(`  ${c.green}✓${c.reset} ${windowLabel(key)} 쿼터 해제\n`);
+      break;
+    }
+    case 'reset': {
+      // 사용량 로그 초기화
+      ensureDir(CONFIG_DIR);
+      fs.writeFileSync(USAGE_LOG_FILE, '[]', 'utf-8');
+      console.log(`  ${c.green}✓${c.reset} 사용량 로그 초기화\n`);
+      break;
+    }
+    default:
+      console.log(`  사용법: /quota [show|set|off|reset]\n`);
+  }
+}
+
+async function cmdAccount() {
+  const provider = detectProvider();
+  const providerName = { openai: 'OpenAI', anthropic: 'Anthropic', zhipu: 'ZhipuAI' }[provider] || CFG.baseUrl;
+  const dashboardUrl = {
+    openai: 'https://platform.openai.com/usage',
+    anthropic: 'https://console.anthropic.com/settings/billing',
+    zhipu: 'https://z.ai/manage-apikey/billing',
+  }[provider] || '';
+
+  console.log(`\n  ${c.bold}API 계정 정보${c.reset}`);
+  console.log(`  ${c.dim}${'─'.repeat(42)}${c.reset}`);
+  console.log(`  ${c.dim}제공자${c.reset} ${c.bold}${providerName}${c.reset}  ${c.dim}서버${c.reset} ${CFG.baseUrl}`);
+  console.log(`  ${c.dim}모델${c.reset}   ${c.cyan}${CFG.model}${c.reset}\n`);
+
+  // 1. 캡처된 응답 헤더 정보
+  if (apiAccountInfo && Object.keys(apiAccountInfo).length > 0) {
+    console.log(`  ${c.cyan}◆ API 응답 헤더${c.reset}`);
+    for (const [key, val] of Object.entries(apiAccountInfo)) {
+      const label = key.replace(/^x-/, '').replace(/-/g, ' ');
+      console.log(`    ${c.dim}${label.padEnd(30)}${c.reset} ${val}`);
+    }
+    console.log('');
+  }
+
+  // 2. 제공자 사용량 API 조회
+  const spinner = createSpinner(`${providerName} 사용량 API 조회`).start();
+  const result = await fetchApiUsage();
+  if (result) {
+    spinner.succeed(`${result.provider || providerName} 사용량 조회 성공`);
+    console.log(`    ${c.dim}엔드포인트: ${result.path}${c.reset}\n`);
+    const data = result.data;
+    if (typeof data === 'object') {
+      // OpenAI: data 배열 형태
+      if (data.data && Array.isArray(data.data)) {
+        console.log(`  ${c.cyan}◆ 사용량 (최근 7일)${c.reset}`);
+        let totalInput = 0, totalOutput = 0, totalReqs = 0;
+        for (const bucket of data.data) {
+          const results = bucket.results || [];
+          for (const r of results) {
+            totalInput += r.input_tokens || r.num_tokens || 0;
+            totalOutput += r.output_tokens || 0;
+            totalReqs += r.num_model_requests || r.num_requests || 0;
+          }
+        }
+        console.log(`    입력:  ${c.bold}${fmtTokens(totalInput)}${c.reset} 토큰`);
+        console.log(`    출력:  ${c.bold}${fmtTokens(totalOutput)}${c.reset} 토큰`);
+        console.log(`    합계:  ${c.bold}${fmtTokens(totalInput + totalOutput)}${c.reset} 토큰`);
+        console.log(`    요청:  ${c.bold}${totalReqs}${c.reset}회`);
+      }
+      // Anthropic: data 배열 형태
+      else if (data.data && Array.isArray(data.data) && data.data[0]?.input_tokens !== undefined) {
+        console.log(`  ${c.cyan}◆ 사용량 (최근 7일)${c.reset}`);
+        let totalInput = 0, totalOutput = 0, totalCache = 0;
+        for (const bucket of data.data) {
+          totalInput += bucket.input_tokens || 0;
+          totalOutput += bucket.output_tokens || 0;
+          totalCache += bucket.cache_read_input_tokens || 0;
+        }
+        console.log(`    입력:      ${c.bold}${fmtTokens(totalInput)}${c.reset} 토큰`);
+        console.log(`    출력:      ${c.bold}${fmtTokens(totalOutput)}${c.reset} 토큰`);
+        console.log(`    캐시 읽기: ${c.bold}${fmtTokens(totalCache)}${c.reset} 토큰`);
+        console.log(`    합계:      ${c.bold}${fmtTokens(totalInput + totalOutput)}${c.reset} 토큰`);
+      }
+      // 일반 필드 표시
+      else {
+        const knownKeys = ['balance', 'credits', 'remaining', 'usage', 'total_usage', 'used',
+          'quota', 'plan', 'subscription', 'tokens_used', 'tokens_remaining', 'total_tokens',
+          'total_cost', 'amount', 'currency'];
+        const shown = new Set();
+        for (const k of knownKeys) {
+          if (data[k] !== undefined) {
+            const val = typeof data[k] === 'object' ? JSON.stringify(data[k]) : data[k];
+            console.log(`    ${c.bold}${k}${c.reset}: ${val}`);
+            shown.add(k);
+          }
+        }
+        for (const [k, v] of Object.entries(data)) {
+          if (shown.has(k)) continue;
+          const val = typeof v === 'object' ? JSON.stringify(v).slice(0, 100) : v;
+          console.log(`    ${c.dim}${k}${c.reset}: ${val}`);
+        }
+      }
+    } else {
+      console.log(`    ${data}`);
+    }
+    console.log('');
+  } else {
+    spinner.fail('사용량 API 접근 불가');
+    if (provider === 'anthropic') {
+      console.log(`  ${c.dim}Anthropic Admin API 키(sk-ant-admin...)가 필요합니다.${c.reset}`);
+    } else if (provider === 'openai') {
+      console.log(`  ${c.dim}OpenAI 조직 API 키가 필요할 수 있습니다.${c.reset}`);
+    }
+    if (dashboardUrl) {
+      console.log(`  ${c.dim}대시보드: ${dashboardUrl}${c.reset}`);
+    }
+    console.log('');
+  }
+
+  // 3. 로컬 세션 사용량 요약
+  console.log(`  ${c.cyan}◆ 로컬 사용량 추적${c.reset}`);
+  const su = sessionUsage;
+  console.log(`    세션: ${c.bold}${fmtTokens(su.totalTokens)}${c.reset} 토큰 (${su.requests}회)`);
+  for (const [key, ms] of Object.entries(QUOTA_WINDOWS)) {
+    const wu = getWindowUsage(ms);
+    console.log(`    ${windowLabel(key).padEnd(6)} ${c.bold}${fmtTokens(wu.totalTokens).padStart(6)}${c.reset} 토큰 (${wu.requests}회)`);
+  }
+  console.log('');
+}
+
 async function cmdDoctor() {
-  console.log(`\n${c.bold}=== 진단 ===${c.reset}\n`);
+  console.log(`\n  ${c.bold}시스템 진단${c.reset}`);
+  console.log(`  ${c.dim}${'─'.repeat(40)}${c.reset}\n`);
 
   // 시스템 정보
-  console.log(`${c.cyan}시스템${c.reset}`);
-  console.log(`  OS: ${os.platform()} ${os.arch()} ${os.release()}`);
-  console.log(`  Node.js: ${process.version}`);
-  console.log(`  메모리: ${formatBytes(os.freemem())} / ${formatBytes(os.totalmem())}`);
-  console.log(`  CPU: ${os.cpus()[0]?.model || '?'} x${os.cpus().length}`);
+  console.log(`  ${c.cyan}◆ 시스템${c.reset}`);
+  console.log(`    OS:       ${os.platform()} ${os.arch()} ${os.release()}`);
+  console.log(`    Node.js:  ${process.version}`);
+  console.log(`    메모리:   ${formatBytes(os.freemem())} / ${formatBytes(os.totalmem())}`);
+  console.log(`    CPU:      ${os.cpus()[0]?.model || '?'} x${os.cpus().length}`);
   console.log('');
 
   // 설정 상태
-  console.log(`${c.cyan}설정${c.reset}`);
-  console.log(`  API 키: ${CFG.apiKey ? c.green + '설정됨 (***' + CFG.apiKey.slice(-4) + ')' + c.reset : c.red + '미설정' + c.reset}`);
-  console.log(`  서버: ${CFG.baseUrl}`);
-  console.log(`  모델: ${CFG.model}`);
-  console.log(`  설정파일: ${fs.existsSync(CONFIG_FILE) ? c.green + '있음' + c.reset : c.dim + '없음' + c.reset}`);
+  console.log(`  ${c.cyan}◆ 설정${c.reset}`);
+  console.log(`    API 키:   ${CFG.apiKey ? c.green + '설정됨 (***' + CFG.apiKey.slice(-4) + ')' + c.reset : c.red + '미설정' + c.reset}`);
+  console.log(`    서버:     ${CFG.baseUrl}`);
+  console.log(`    모델:     ${CFG.model}`);
+  console.log(`    설정파일: ${fs.existsSync(CONFIG_FILE) ? c.green + '있음' + c.reset : c.dim + '없음' + c.reset}`);
   console.log('');
 
   // API 연결 테스트
   if (CFG.apiKey) {
-    console.log(`${c.cyan}API 연결 테스트${c.reset}`);
+    console.log(`  ${c.cyan}◆ API 연결 테스트${c.reset}`);
+    let spin;
+
+    spin = createSpinner('토크나이저 테스트...').start();
     try {
       const start = Date.now();
       const res = await zaiTokenize([{ role: 'user', content: '안녕' }]);
-      const ms = Date.now() - start;
-      console.log(`  토크나이저: ${c.green}OK${c.reset} (${ms}ms, ${res.usage?.total_tokens || '?'}토큰)`);
+      spin.succeed(`토크나이저: OK (${Date.now() - start}ms, ${res.usage?.total_tokens || '?'}토큰)`);
     } catch (e) {
-      console.log(`  토크나이저: ${c.red}실패${c.reset} - ${e.message}`);
+      spin.fail(`토크나이저: 실패 - ${e.message}`);
     }
 
+    spin = createSpinner('웹 검색 테스트...').start();
     try {
       const start = Date.now();
       const res = await zaiWebSearch('test');
-      const ms = Date.now() - start;
       const count = res.search_result?.length || 0;
-      console.log(`  웹 검색: ${c.green}OK${c.reset} (${ms}ms, ${count}건)`);
+      spin.succeed(`웹 검색: OK (${Date.now() - start}ms, ${count}건)`);
     } catch (e) {
-      console.log(`  웹 검색: ${c.red}실패${c.reset} - ${e.message}`);
+      spin.fail(`웹 검색: 실패 - ${e.message}`);
     }
 
+    spin = createSpinner(`채팅 테스트 (${CFG.model})...`).start();
     try {
       const start = Date.now();
       const res = await apiPost(CFG.apiPrefix + '/chat/completions', {
         model: CFG.model, messages: [{ role: 'user', content: '1+1=' }], max_tokens: 5,
       });
-      const ms = Date.now() - start;
       const answer = res.choices?.[0]?.message?.content || '';
-      console.log(`  채팅 (${CFG.model}): ${c.green}OK${c.reset} (${ms}ms) "${answer.trim().slice(0,30)}"`);
+      spin.succeed(`채팅 (${CFG.model}): OK (${Date.now() - start}ms) "${answer.trim().slice(0,30)}"`);
     } catch (e) {
-      console.log(`  채팅 (${CFG.model}): ${c.red}실패${c.reset} - ${e.message}`);
+      spin.fail(`채팅 (${CFG.model}): 실패 - ${e.message}`);
     }
   }
   console.log('');
@@ -2204,21 +3101,31 @@ async function cmdMcp(arg) {
       for (const sname of configServers) {
         const cfg = config.servers[sname];
         const connected = mcpServers[sname];
-        const toolCount = connected ? connected.tools.length : 0;
-        const status = connected ? `${c.green}연결됨${c.reset} (${toolCount}개 도구)` : `${c.dim}연결 안됨${c.reset}`;
-        const transport = mcpTransportType(cfg);
-        const target = transport === 'stdio' ? `${cfg.command} ${(cfg.args || []).join(' ')}` : cfg.url;
-        console.log(`  ${c.cyan}${sname.padEnd(15)}${c.reset} [${transport}] ${status}`);
-        console.log(`  ${c.dim}${' '.repeat(15)} ${target}${c.reset}`);
+        const lazy = mcpLazy[sname];
+        let status, toolCount;
         if (connected) {
-          for (const t of connected.tools) {
-            console.log(`  ${' '.repeat(15)} ${c.magenta}${t.name}${c.reset} ${c.dim}${(t.description || '').slice(0, 50)}${c.reset}`);
-          }
+          toolCount = connected.tools.length;
+          status = `${c.green}연결됨${c.reset} (${toolCount}개 도구)`;
+        } else if (lazy) {
+          toolCount = lazy.tools.length;
+          status = `${c.blue}lazy${c.reset} (${toolCount}개 도구, 호출 시 연결)`;
+        } else {
+          toolCount = 0;
+          status = `${c.dim}연결 안됨${c.reset}`;
+        }
+        const transport = mcpTransportType(cfg);
+        const lazyFlag = cfg.lazy !== false ? ` ${c.blue}lazy${c.reset}` : '';
+        const target = transport === 'stdio' ? `${cfg.command} ${(cfg.args || []).join(' ')}` : cfg.url;
+        console.log(`  ${c.cyan}${sname.padEnd(15)}${c.reset} [${transport}${lazyFlag}] ${status}`);
+        console.log(`  ${c.dim}${' '.repeat(15)} ${target}${c.reset}`);
+        const toolList = connected ? connected.tools : (lazy ? lazy.tools : []);
+        for (const t of toolList) {
+          console.log(`  ${' '.repeat(15)} ${c.magenta}${t.name}${c.reset} ${c.dim}${(t.description || '').slice(0, 50)}${c.reset}`);
         }
       }
       console.log(`\n  /mcp add <이름> <URL>              HTTP 서버 등록`);
       console.log(`  /mcp stdio <이름> <명령> [인자...] [--env K=V ...]  stdio 서버 등록`);
-      console.log(`  /mcp remove|connect|disconnect|tools\n`);
+      console.log(`  /mcp remove|connect|disconnect|tools|lazy|refresh\n`);
       break;
     }
     case 'add': {
@@ -2264,6 +3171,10 @@ async function cmdMcp(arg) {
         saveMcpConfig(config);
       }
       await mcpDisconnect(name);
+      delete mcpLazy[name];
+      // 도구 캐시도 정리
+      const cache = loadMcpToolCache();
+      if (cache[name]) { delete cache[name]; saveMcpToolCache(cache); }
       console.log(`${c.green}MCP 서버 제거: ${name}${c.reset}\n`);
       break;
     }
@@ -2272,17 +3183,15 @@ async function cmdMcp(arg) {
       const config = loadMcpConfig();
       const serverCfg = config.servers?.[name];
       if (!serverCfg) { console.log(`${c.red}등록되지 않은 서버: ${name}${c.reset}\n`); return; }
+      const spin = createSpinner(`MCP 연결중... (${name})`).start();
       try {
-        process.stdout.write(`${c.dim}MCP 연결중...${c.reset}`);
         const tools = await mcpConnect(name, serverCfg);
-        process.stdout.write('\r\x1b[K');
-        console.log(`${c.green}MCP 연결: ${name}${c.reset} (${tools.length}개 도구)`);
+        spin.succeed(`MCP 연결: ${name} (${tools.length}개 도구)`);
         for (const t of tools) {
-          console.log(`  ${c.magenta}${t.name}${c.reset} ${c.dim}${(t.description || '').slice(0, 60)}${c.reset}`);
+          console.log(`    ${c.magenta}▸${c.reset} ${t.name} ${c.dim}${(t.description || '').slice(0, 60)}${c.reset}`);
         }
       } catch (e) {
-        process.stdout.write('\r\x1b[K');
-        console.log(`${c.red}MCP 연결 실패: ${e.message}${c.reset}`);
+        spin.fail(`MCP 연결 실패: ${e.message}`);
       }
       console.log('');
       break;
@@ -2304,8 +3213,39 @@ async function cmdMcp(arg) {
       console.log('');
       break;
     }
+    case 'refresh': {
+      // 캐시 갱신: lazy 서버를 일시 연결하여 도구 목록 갱신 후 다시 lazy로 전환
+      if (!name) { console.log(`${c.yellow}사용법: /mcp refresh <이름>${c.reset}\n`); return; }
+      const config = loadMcpConfig();
+      const serverCfg = config.servers?.[name];
+      if (!serverCfg) { console.log(`${c.red}등록되지 않은 서버: ${name}${c.reset}\n`); return; }
+      const spin = createSpinner(`MCP 도구 캐시 갱신중... (${name})`).start();
+      try {
+        const tools = await mcpConnect(name, serverCfg);
+        // 연결 후 즉시 해제하여 lazy 상태 복원
+        await mcpDisconnect(name);
+        mcpLazy[name] = { config: serverCfg, tools };
+        spin.succeed(`캐시 갱신: ${name} (${tools.length}개 도구)`);
+      } catch (e) {
+        spin.fail(`캐시 갱신 실패: ${e.message}`);
+      }
+      console.log('');
+      break;
+    }
+    case 'lazy': {
+      // /mcp lazy <이름> — lazy 모드 토글
+      if (!name) { console.log(`${c.yellow}사용법: /mcp lazy <이름>${c.reset}\n`); return; }
+      const config = loadMcpConfig();
+      if (!config.servers?.[name]) { console.log(`${c.red}등록되지 않은 서버: ${name}${c.reset}\n`); return; }
+      const current = config.servers[name].lazy !== false;
+      config.servers[name].lazy = !current;
+      saveMcpConfig(config);
+      const newState = !current ? `${c.blue}lazy${c.reset} (호출 시 연결)` : `${c.green}eager${c.reset} (시작 시 연결)`;
+      console.log(`${c.green}MCP ${name}${c.reset}: ${newState}\n`);
+      break;
+    }
     default:
-      console.log(`  사용법: /mcp [list|add|stdio|remove|connect|disconnect|tools]\n`);
+      console.log(`  사용법: /mcp [list|add|stdio|remove|connect|disconnect|tools|refresh|lazy]\n`);
   }
 }
 
@@ -2462,105 +3402,133 @@ Conventional Commits 형식을 사용하세요.
 
 function printHelp() {
   console.log(`
-${c.bold}=== Light-zai v${VERSION} 명령어 ===${c.reset}
+  ${c.bold}Light-zai v${VERSION} 명령어${c.reset}
+  ${c.dim}${'─'.repeat(40)}${c.reset}
 
-${c.cyan}대화${c.reset}
-  /clear          대화 기록 초기화
-  /history        대화 기록 보기
-  /pop            마지막 대화 쌍 제거
-  /save [이름]    세션 저장
-  /load [이름]    세션 로드
-  /sessions       저장된 세션 목록
+  ${c.cyan}◆ 대화${c.reset}
+    /clear          대화 기록 초기화
+    /history        대화 기록 보기
+    /pop            마지막 대화 쌍 제거
+    /save [이름]    세션 저장
+    /load [이름]    세션 로드
+    /sessions       저장된 세션 목록
 
-${c.cyan}설정${c.reset}
-  /model [이름]   모델 변경/목록
-  /stream         스트리밍 토글
-  /think          사고 모드 토글
-  /tools          도구 호출 토글
-  /websearch      웹 검색 토글
-  /json           JSON 모드 토글
-  /config [키 값] 설정 보기/변경
-  /config save    설정 파일로 저장
+  ${c.cyan}◆ 설정${c.reset}
+    /model [이름]   모델 변경/목록
+    /stream         스트리밍 토글
+    /think          사고 모드 토글
+    /tools          도구 호출 토글
+    /websearch      웹 검색 토글
+    /json           JSON 모드 토글
+    /hud            사용량 HUD 토글
+    /approve        도구 자동 승인 토글 (y/n/a 확인 생략)
+    /usage          사용량 상세 (세션 + 구간별)
+    /quota          쿼터 설정 (5h/daily/weekly)
+    /account        API 계정 정보 (헤더/잔액/사용량)
+    /config [키 값] 설정 보기/변경
+    /config save    설정 파일로 저장
 
-${c.cyan}API / 검색${c.reset}
-  /search <검색어>    웹 검색 (DuckDuckGo)
-  /zsearch <검색어>   웹 검색 (search-prime)
-  /read <URL>         URL 읽기 (웹 리더)
-  /image <프롬프트>   이미지 생성 [--size WxH]
-  /video <프롬프트>   비디오 생성 [--audio] [--duration N] [--fps N]
-  /poll <작업ID>      비동기 작업 결과 조회
-  /ocr <URL>          OCR 레이아웃 파싱
-  /embed <텍스트>     텍스트 임베딩
-  /tokens             현재 대화 토큰 수
-  /upload <파일>      파일 업로드
-  /transcribe <파일>  음성 인식 (ASR)
+  ${c.cyan}◆ API / 검색${c.reset}
+    /search <검색어>    웹 검색 (DuckDuckGo)
+    /zsearch <검색어>   웹 검색 (search-prime)
+    /read <URL>         URL 읽기 (웹 리더)
+    /image <프롬프트>   이미지 생성 ${c.dim}[--size WxH]${c.reset}
+    /video <프롬프트>   비디오 생성 ${c.dim}[--audio] [--duration N]${c.reset}
+    /poll <작업ID>      비동기 작업 결과 조회
+    /ocr <URL>          OCR 레이아웃 파싱
+    /embed <텍스트>     텍스트 임베딩
+    /tokens             현재 대화 토큰 수
+    /upload <파일>      파일 업로드
+    /transcribe <파일>  음성 인식 (ASR)
 
-${c.cyan}프리셋${c.reset}
-  /preset         프리셋 목록
-  /preset load <이름>  프리셋 적용
-  /preset save <이름>  프리셋 저장
-  /preset show    활성 프리셋 보기
-  /preset off     프리셋 해제
-  /preset delete <이름> 프리셋 삭제
+  ${c.cyan}◆ 프리셋${c.reset}
+    /preset              프리셋 목록
+    /preset load <이름>  프리셋 적용
+    /preset save <이름>  프리셋 저장
+    /preset show         활성 프리셋 보기
+    /preset off          프리셋 해제
 
-${c.cyan}스킬${c.reset}  ${c.dim}(/<스킬이름> [인자]로 호출)${c.reset}
-  /skill          스킬 목록
-  /skill init     기본 스킬 세트 생성
-  /skill new <이름>     스킬 생성
-  /skill show <이름>    스킬 내용 보기
-  /skill edit <이름>    스킬 편집
-  /skill delete <이름>  스킬 삭제
+  ${c.cyan}◆ 스킬${c.reset}  ${c.dim}(/<스킬이름> [인자]로 호출)${c.reset}
+    /skill          스킬 목록
+    /skill init     기본 스킬 세트 생성
+    /skill new      스킬 생성
+    /skill show     스킬 내용 보기
+    /skill edit     스킬 편집
 
-${c.cyan}MCP 서버${c.reset}
-  /mcp                        서버 목록
-  /mcp add <이름> <URL>       HTTP 서버 등록
-  /mcp stdio <이름> <cmd...> [--env K=V ...]  stdio 서버 등록
-  /mcp remove <이름>          서버 제거
-  /mcp connect <이름>         서버 연결
-  /mcp disconnect <이름>      서버 연결 해제
-  /mcp tools                  연결된 MCP 도구 목록
+  ${c.cyan}◆ MCP 서버${c.reset} ${c.dim}(기본 lazy: 호출 시 자동 연결)${c.reset}
+    /mcp                         서버 목록
+    /mcp add <이름> <URL>        HTTP 서버 등록
+    /mcp stdio <이름> <cmd...>   stdio 서버 등록
+    /mcp connect|disconnect      서버 연결/해제
+    /mcp tools                   MCP 도구 목록
+    /mcp lazy <이름>             lazy 모드 토글
+    /mcp refresh <이름>          도구 캐시 갱신
 
-${c.cyan}기타${c.reset}
-  /doctor         시스템 진단
-  /status         현재 상태
-  /help           이 도움말
-  /exit           종료
-  ${c.bold}!${c.reset}              Bash 모드 전환 (exit로 복귀)
+  ${c.cyan}◆ 기타${c.reset}
+    /doctor   시스템 진단    /status   현재 상태
+    /help     이 도움말      /exit     종료
+    ${c.bold}!${c.reset}         Bash 모드 전환 ${c.dim}(exit로 복귀)${c.reset}
+
+  ${c.cyan}◆ 단축키${c.reset}
+    Shift+↑/↓   출력 기록 스크롤 모드
+                ${c.dim}↑↓:1줄  PgUp/Dn:페이지  Home/End  ESC:닫기${c.reset}
 `);
 }
 
 function printStatus() {
   const msgCount = conversationHistory.length - 1;
   const turns = Math.floor(msgCount / 2);
-  console.log(`
-${c.bold}현재 상태${c.reset}
-  모드:     ${bashMode ? c.yellow + 'Bash' : c.green + 'AI'}${c.reset}
-  모델:     ${c.cyan}${CFG.model}${c.reset}
-  대화:     ${turns}턴 (${conversationHistory.length}메시지)
-  스트리밍: ${CFG.stream ? c.green + 'ON' : c.dim + 'OFF'}${c.reset}
-  사고:     ${CFG.think ? c.green + 'ON' : c.dim + 'OFF'}${c.reset}
-  도구:     ${CFG.tools ? c.green + 'ON' : c.dim + 'OFF'}${c.reset}
-  웹검색:   ${CFG.webSearch ? c.green + 'ON' : c.dim + 'OFF'}${c.reset}
-  JSON:     ${CFG.jsonMode ? c.green + 'ON' : c.dim + 'OFF'}${c.reset}
-  프리셋:   ${activePreset ? c.green + activePreset.name + c.reset : c.dim + 'OFF' + c.reset}
-  MCP:      ${Object.keys(mcpServers).length > 0 ? c.green + Object.keys(mcpServers).join(', ') + c.reset + ` (${getMcpFunctionTools().length}개 도구)` : c.dim + '없음' + c.reset}
-  디렉토리: ${CFG.workspace}${lastUsage ? `\n  마지막 토큰: 입력 ${lastUsage.prompt_tokens || '?'} + 출력 ${lastUsage.completion_tokens || '?'} = 합계 ${lastUsage.total_tokens || '?'}` : ''}
-`);
+  const mode = bashMode ? `${c.yellow}Bash${c.reset}` : `${c.green}AI${c.reset}`;
+  const connNames = Object.keys(mcpServers);
+  const lazyNames = Object.keys(mcpLazy);
+  const mcpParts = [];
+  if (connNames.length) mcpParts.push(`${c.green}${connNames.join(', ')}${c.reset}`);
+  if (lazyNames.length) mcpParts.push(`${c.blue}${lazyNames.join(', ')}${c.reset}${c.dim}(lazy)${c.reset}`);
+  const mcpInfo = mcpParts.length ? `${mcpParts.join(', ')} (${getMcpFunctionTools().length}개 도구)` : `${c.dim}없음${c.reset}`;
+  const tokenInfo = lastUsage
+    ? `입력 ${lastUsage.prompt_tokens || '?'} + 출력 ${lastUsage.completion_tokens || '?'} = ${c.bold}${lastUsage.total_tokens || '?'}${c.reset}`
+    : `${c.dim}없음${c.reset}`;
+  const content = [
+    `${c.dim}모드${c.reset}       ${mode}              ${c.dim}모델${c.reset} ${c.cyan}${CFG.model}${c.reset}`,
+    `${c.dim}대화${c.reset}       ${turns}턴 (${conversationHistory.length}메시지)`,
+    '',
+    `${c.dim}스트리밍${c.reset}   ${onoff(CFG.stream)}     ${c.dim}사고${c.reset}   ${onoff(CFG.think)}`,
+    `${c.dim}도구${c.reset}       ${onoff(CFG.tools)}     ${c.dim}검색${c.reset}   ${onoff(CFG.webSearch)}`,
+    `${c.dim}승인${c.reset}       ${CFG.autoApprove ? c.yellow + '자동' + c.reset : c.green + '확인' + c.reset}${toolApproveSession.size ? c.dim + ` (+${[...toolApproveSession].join(',')})` + c.reset : ''}     ${c.dim}HUD${c.reset}    ${onoff(hudEnabled)}`,
+    `${c.dim}JSON${c.reset}       ${onoff(CFG.jsonMode)}`,
+    '',
+    `${c.dim}프리셋${c.reset}     ${activePreset ? c.green + activePreset.name + c.reset : c.dim + 'OFF' + c.reset}`,
+    `${c.dim}MCP${c.reset}        ${mcpInfo}`,
+    `${c.dim}토큰${c.reset}       ${tokenInfo}`,
+    `${c.dim}세션 합계${c.reset}  ${sessionUsage.requests}회 / ${c.bold}${fmtTokens(sessionUsage.totalTokens)}${c.reset} 토큰`,
+    `${c.dim}디렉토리${c.reset}   ${CFG.workspace}`,
+  ];
+  console.log('\n' + drawBox(content, { title: `${c.bold}현재 상태${c.reset}`, color: c.cyan }) + '\n');
 }
 
 // ===== 스플래시 화면 =====
 function showSplash() {
   if (!IS_TTY) return;
-  console.log(`
-${c.cyan}  ╔═════════════════════════════════════════════╗
-  ║${c.reset}${c.bold}          Light-zai v${VERSION}                ${c.reset}${c.cyan}║
-  ║${c.reset}     경량 올인원 AI 코딩 어시스턴트          ${c.cyan}║
-  ║${c.reset}${c.dim}   ARM7L / x86_64 / aarch64 — 무의존성       ${c.reset}${c.cyan}║
-  ╚═════════════════════════════════════════════╝${c.reset}
-  ${c.dim}모델: ${CFG.model} | 서버: ${CFG.baseUrl}${c.reset}
-  ${c.dim}스트리밍: ${CFG.stream ? 'ON' : 'OFF'} | 사고: ${CFG.think ? 'ON' : 'OFF'} | 도구: ${CFG.tools ? 'ON' : 'OFF'} | 웹검색: ${CFG.webSearch ? 'ON' : 'OFF'}${c.reset}
-  ${c.dim}/help 로 명령어 확인 | ! 로 Bash 전환${c.reset}
-`);
+  const features = [
+    CFG.stream ? `${c.green}●${c.reset} 스트리밍` : `${c.dim}○ 스트리밍${c.reset}`,
+    CFG.think  ? `${c.green}●${c.reset} 사고` : `${c.dim}○ 사고${c.reset}`,
+    CFG.tools  ? `${c.green}●${c.reset} 도구` : `${c.dim}○ 도구${c.reset}`,
+    CFG.webSearch ? `${c.green}●${c.reset} 검색` : `${c.dim}○ 검색${c.reset}`,
+  ].join('  ');
+  const content = [
+    '',
+    `${c.bold}     Light-zai${c.reset} ${c.dim}v${VERSION}${c.reset}`,
+    `     경량 올인원 AI 코딩 어시스턴트`,
+    `     ${c.dim}ARM7L / x86_64 / aarch64 — 무의존성${c.reset}`,
+    '',
+    `  ${c.dim}모델${c.reset}  ${c.cyan}${CFG.model}${c.reset}`,
+    `  ${c.dim}서버${c.reset}  ${CFG.baseUrl}`,
+    `  ${features}`,
+    '',
+    `  ${c.dim}/help${c.reset} 명령어 확인  ${c.dim}!${c.reset} Bash 전환`,
+    '',
+  ];
+  console.log('\n' + drawBox(content, { color: c.cyan }) + '\n');
 }
 
 // ===== 원샷 모드 =====
@@ -2579,9 +3547,9 @@ async function runOneShot(question) {
     if (started) process.stdout.write('\n');
   } else {
     conversationHistory.push({ role: 'user', content: question });
-    process.stdout.write(`${c.dim}[처리중...]${c.reset}`);
+    const oneSpin = createSpinner('응답 대기중...').start();
     const res = await zaiChat(conversationHistory);
-    process.stdout.write('\r\x1b[K');
+    oneSpin.stop();
     const content = res.choices?.[0]?.message?.content;
     if (content) console.log(content);
   }
@@ -2665,9 +3633,14 @@ async function main() {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   _rl = rl;
 
+  // 스크롤 시스템 초기화 (출력 캡처 + 키 인터셉터)
+  initOutputCapture();
+  installScrollKeyHandler();
+
   function getPrompt() {
-    if (bashMode) return `${c.yellow}bash${c.reset}:${path.basename(CFG.workspace)}$ `;
-    return `${c.cyan}사용자${c.reset}> `;
+    if (bashMode) return `${c.yellow}bash${c.reset} ${c.dim}${path.basename(CFG.workspace)}${c.reset} ${c.yellow}▸${c.reset} `;
+    const usage = hudEnabled && sessionUsage.totalTokens > 0 ? `${c.dim}[${fmtTokens(sessionUsage.totalTokens)}]${c.reset} ` : '';
+    return `${usage}${c.cyan}사용자${c.reset} ${c.cyan}▸${c.reset} `;
   }
 
   function prompt() { rl.setPrompt(getPrompt()); rl.prompt(); }
@@ -2681,13 +3654,13 @@ async function main() {
     // Bash 모드 토글
     if (input === '!') {
       bashMode = !bashMode;
-      console.log(bashMode ? `\n${c.yellow}Bash 모드${c.reset} (exit 로 복귀)\n` : `\n${c.green}AI 모드${c.reset}\n`);
+      console.log(bashMode ? `\n  ${c.yellow}▸ Bash 모드${c.reset} ${c.dim}(exit 로 복귀)${c.reset}\n` : `\n  ${c.green}▸ AI 모드${c.reset}\n`);
       prompt(); return;
     }
 
     // Bash 모드
     if (bashMode) {
-      if (input === 'exit') { bashMode = false; console.log(`\n${c.green}AI 모드${c.reset}\n`); prompt(); return; }
+      if (input === 'exit') { bashMode = false; console.log(`\n  ${c.green}▸ AI 모드${c.reset}\n`); prompt(); return; }
       console.log('');
       const result = await executeBashCommand(input);
       if (result.stdout) process.stdout.write(result.stdout);
@@ -2715,7 +3688,7 @@ async function main() {
     try {
       const response = await sendMessage(input);
       if (response && !CFG.stream) {
-        console.log(`${c.green}AI>${c.reset} ${response}\n`);
+        console.log(`${c.green}AI ▸${c.reset} ${response}\n`);
       } else if (response) {
         console.log(''); // 스트리밍 후 줄바꿈
       }
