@@ -104,6 +104,7 @@ const CFG = {
   temperature:parseFloat(process.env.LZAI_TEMPERATURE || savedCfg.temperature || DEFAULT_CONFIG.temperature),
   jsonMode:   false,
   autoApprove: process.env.LZAI_AUTO_APPROVE === '1', // 도구 자동 승인 (기본: 꺼짐)
+  jwt:        process.env.LZAI_JWT || '', // 웹 대시보드 JWT (Z.AI 사용량 조회용)
 };
 
 // ===== 전역 상태 =====
@@ -736,94 +737,58 @@ function captureApiHeaders(headers) {
   }
 }
 
-// API 제공자 감지
-function detectProvider() {
+// Z.AI 리전 감지 (글로벌: api.z.ai / 중국: open.bigmodel.cn)
+function detectRegion() {
   const host = CFG.baseUrl.toLowerCase();
-  if (host.includes('openai') || host.includes('api.openai.com')) return 'openai';
-  if (host.includes('anthropic') || host.includes('claude')) return 'anthropic';
-  if (host.includes('z.ai') || host.includes('bigmodel')) return 'zhipu';
-  return 'unknown';
+  if (host.includes('z.ai')) return 'global';
+  if (host.includes('bigmodel')) return 'cn';
+  return 'global';
 }
 
-// 사용량 엔드포인트 탐색 (제공자별)
+// Z.AI JWT 요청 헬퍼
+function zaiGet(host, path, jwt) {
+  return httpRequest({
+    hostname: host, port: 443, protocol: 'https:',
+    path, method: 'GET',
+    headers: { 'Authorization': `Bearer ${jwt}`, 'Accept': 'application/json' },
+    timeout: 15000,
+  });
+}
+
+// Z.AI 사용량 조회 (웹 대시보드 JWT 필요)
 async function fetchApiUsage() {
-  const provider = detectProvider();
+  const jwt = CFG.jwt;
+  if (!jwt) return { needJwt: true };
+
+  const region = detectRegion();
+  const host = region === 'cn' ? 'open.bigmodel.cn' : 'api.z.ai';
+  const result = { host };
+
+  // 1) 쿼터/한도
+  try {
+    const res = await zaiGet(host, '/api/monitor/usage/quota/limit', jwt);
+    if (res?.success || res?.code === 200) result.quota = (res.data || res);
+  } catch (_) {}
+
+  // 2) 모델별 사용량 (최근 7일)
   const now = new Date();
-  const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const weekAgo = new Date(now.getTime() - 7 * 86400000);
+  const startTime = encodeURIComponent(weekAgo.toISOString().slice(0, 10) + ' 00:00:00');
+  const endTime = encodeURIComponent(now.toISOString().slice(0, 10) + ' 23:59:59');
+  try {
+    const res = await zaiGet(host, `/api/monitor/usage/model-usage?startTime=${startTime}&endTime=${endTime}`, jwt);
+    if (res?.success || res?.code === 200) result.modelUsage = (res.data || res);
+  } catch (_) {}
 
-  // OpenAI: /v1/organization/usage/completions
-  if (provider === 'openai') {
-    const startSec = Math.floor(weekAgo.getTime() / 1000);
-    const endpoints = [
-      `/v1/organization/usage/completions?start_time=${startSec}&bucket_width=1d`,
-      `/v1/organization/usage?start_time=${startSec}&bucket_width=1d`,
-      `/v1/dashboard/billing/usage?start_date=${fmt(weekAgo)}&end_date=${fmt(now)}`,
-      `/v1/dashboard/billing/subscription`,
-    ];
-    for (const p of endpoints) {
-      try {
-        debugLog('OpenAI 사용량 조회:', p);
-        const res = await apiGet(p);
-        if (res && typeof res === 'object') return { provider: 'OpenAI', path: p, data: res };
-      } catch (_) {}
-    }
-  }
+  // 3) 도구 사용량 (최근 7일)
+  try {
+    const res = await zaiGet(host, `/api/monitor/usage/tool-usage?startTime=${startTime}&endTime=${endTime}`, jwt);
+    if (res?.success || res?.code === 200) result.toolUsage = (res.data || res);
+  } catch (_) {}
 
-  // Anthropic: /v1/organizations/usage_report/messages (Admin API 키 필요)
-  if (provider === 'anthropic') {
-    const startISO = weekAgo.toISOString();
-    const endISO = now.toISOString();
-    const endpoints = [
-      `/v1/organizations/usage_report/messages?starting_at=${startISO}&ending_at=${endISO}&bucket_width=1d`,
-      `/v1/organizations/cost_report?starting_at=${startISO}&ending_at=${endISO}`,
-    ];
-    const anthropicHeaders = { 'anthropic-version': '2023-06-01', 'x-api-key': CFG.apiKey };
-    for (const p of endpoints) {
-      try {
-        debugLog('Anthropic 사용량 조회:', p);
-        const opts = {
-          hostname: CFG.baseUrl, port: 443, protocol: 'https:',
-          path: p, method: 'GET',
-          headers: { ...anthropicHeaders, 'Accept-Language': 'ko-KR,ko' },
-          timeout: 15000,
-        };
-        const res = await httpRequest(opts);
-        if (res && typeof res === 'object') return { provider: 'Anthropic', path: p, data: res };
-      } catch (_) {}
-    }
-  }
-
-  // ZhipuAI / 일반: 비공식 탐색
-  const genericPaths = [
-    CFG.apiPrefix + '/usage',
-    CFG.apiPrefix + '/billing/usage',
-    CFG.apiPrefix + '/balance',
-    CFG.apiPrefix + '/account',
-    CFG.apiPrefix + '/quota',
-    CFG.apiPrefix + '/dashboard/billing/usage',
-    CFG.apiPrefix + '/dashboard/billing/subscription',
-    CFG.apiPrefix + '/dashboard/billing/credit_grants',
-    '/api/paas/v4/usage',
-    '/api/paas/v4/balance',
-    '/api/paas/v4/finance/balance',
-    '/api/user/usage',
-    '/api/user/balance',
-    '/api/user/finance',
-  ];
-  for (const p of genericPaths) {
-    try {
-      debugLog('사용량 조회 시도:', p);
-      const res = await apiGet(p);
-      if (res && typeof res === 'object') {
-        debugLog('사용량 응답:', JSON.stringify(res).slice(0, 500));
-        return { provider: provider === 'zhipu' ? 'ZhipuAI' : CFG.baseUrl, path: p, data: res };
-      }
-    } catch (_) {}
-  }
-  return null;
+  if (!result.quota && !result.modelUsage && !result.toolUsage) return null;
+  return result;
 }
-
-function fmt(d) { return d.toISOString().slice(0, 10); }
 
 // ===== API 요청 헬퍼 =====
 function apiOpts(method, apiPath, extraHeaders) {
@@ -2815,18 +2780,15 @@ async function cmdQuota(arg) {
 }
 
 async function cmdAccount() {
-  const provider = detectProvider();
-  const providerName = { openai: 'OpenAI', anthropic: 'Anthropic', zhipu: 'ZhipuAI' }[provider] || CFG.baseUrl;
-  const dashboardUrl = {
-    openai: 'https://platform.openai.com/usage',
-    anthropic: 'https://console.anthropic.com/settings/billing',
-    zhipu: 'https://z.ai/manage-apikey/billing',
-  }[provider] || '';
+  const region = detectRegion();
+  const regionLabel = region === 'cn' ? '중국' : '글로벌';
+  const dashboardUrl = region === 'cn' ? 'https://open.bigmodel.cn/finance' : 'https://z.ai/manage-apikey/billing';
 
   console.log(`\n  ${c.bold}API 계정 정보${c.reset}`);
   console.log(`  ${c.dim}${'─'.repeat(42)}${c.reset}`);
-  console.log(`  ${c.dim}제공자${c.reset} ${c.bold}${providerName}${c.reset}  ${c.dim}서버${c.reset} ${CFG.baseUrl}`);
-  console.log(`  ${c.dim}모델${c.reset}   ${c.cyan}${CFG.model}${c.reset}\n`);
+  console.log(`  ${c.dim}서버${c.reset}   ${c.bold}${CFG.baseUrl}${c.reset} ${c.dim}(${regionLabel})${c.reset}`);
+  console.log(`  ${c.dim}모델${c.reset}   ${c.cyan}${CFG.model}${c.reset}`);
+  console.log(`  ${c.dim}JWT${c.reset}    ${CFG.jwt ? c.green + '설정됨' + c.reset : c.dim + '없음' + c.reset}\n`);
 
   // 1. 캡처된 응답 헤더 정보
   if (apiAccountInfo && Object.keys(apiAccountInfo).length > 0) {
@@ -2838,79 +2800,85 @@ async function cmdAccount() {
     console.log('');
   }
 
-  // 2. 제공자 사용량 API 조회
-  const spinner = createSpinner(`${providerName} 사용량 API 조회`).start();
+  // 2. Z.AI 사용량 API 조회 (JWT 필요)
+  const spinner = createSpinner('Z.AI 사용량 조회').start();
   const result = await fetchApiUsage();
-  if (result) {
-    spinner.succeed(`${result.provider || providerName} 사용량 조회 성공`);
-    console.log(`    ${c.dim}엔드포인트: ${result.path}${c.reset}\n`);
-    const data = result.data;
-    if (typeof data === 'object') {
-      // OpenAI: data 배열 형태
-      if (data.data && Array.isArray(data.data)) {
-        console.log(`  ${c.cyan}◆ 사용량 (최근 7일)${c.reset}`);
-        let totalInput = 0, totalOutput = 0, totalReqs = 0;
-        for (const bucket of data.data) {
-          const results = bucket.results || [];
-          for (const r of results) {
-            totalInput += r.input_tokens || r.num_tokens || 0;
-            totalOutput += r.output_tokens || 0;
-            totalReqs += r.num_model_requests || r.num_requests || 0;
-          }
+  if (result && result.needJwt) {
+    spinner.fail('JWT 토큰 필요');
+    console.log(`  ${c.dim}z.ai 로그인 → 개발자 도구 → Network → Authorization 헤더의 JWT 복사${c.reset}`);
+    console.log(`  ${c.dim}설정: LZAI_JWT="eyJ..." 또는 /config jwt <토큰>${c.reset}\n`);
+  } else if (result && (result.quota || result.modelUsage || result.toolUsage)) {
+    spinner.succeed(`사용량 조회 성공 (${result.host})`);
+
+    // — 쿼터/한도 —
+    if (result.quota) {
+      const q = result.quota;
+      if (q.level) console.log(`    ${c.dim}등급${c.reset} ${c.bold}${q.level}${c.reset}`);
+      const LIMIT_LABEL = { TIME_LIMIT: '요청 한도', TOKENS_LIMIT: '토큰 한도' };
+      for (const lim of (q.limits || [])) {
+        const label = LIMIT_LABEL[lim.type] || lim.type;
+        console.log(`\n  ${c.cyan}◆ ${label}${c.reset}`);
+        if (lim.usage !== undefined && lim.remaining !== undefined) {
+          const used = lim.currentValue || (lim.usage - lim.remaining);
+          const pct = lim.percentage || 0;
+          const filled = Math.round(20 * pct / 100);
+          console.log(`    ${c.green}${'█'.repeat(filled)}${c.dim}${'░'.repeat(20 - filled)}${c.reset} ${c.bold}${used}${c.reset}/${lim.usage} ${c.dim}(${pct}%)${c.reset}  잔여 ${c.bold}${lim.remaining}${c.reset}`);
+        } else if (lim.percentage !== undefined) {
+          const filled = Math.round(20 * lim.percentage / 100);
+          console.log(`    ${c.green}${'█'.repeat(filled)}${c.dim}${'░'.repeat(20 - filled)}${c.reset} ${c.bold}${lim.percentage}%${c.reset} 사용`);
         }
-        console.log(`    입력:  ${c.bold}${fmtTokens(totalInput)}${c.reset} 토큰`);
-        console.log(`    출력:  ${c.bold}${fmtTokens(totalOutput)}${c.reset} 토큰`);
-        console.log(`    합계:  ${c.bold}${fmtTokens(totalInput + totalOutput)}${c.reset} 토큰`);
-        console.log(`    요청:  ${c.bold}${totalReqs}${c.reset}회`);
-      }
-      // Anthropic: data 배열 형태
-      else if (data.data && Array.isArray(data.data) && data.data[0]?.input_tokens !== undefined) {
-        console.log(`  ${c.cyan}◆ 사용량 (최근 7일)${c.reset}`);
-        let totalInput = 0, totalOutput = 0, totalCache = 0;
-        for (const bucket of data.data) {
-          totalInput += bucket.input_tokens || 0;
-          totalOutput += bucket.output_tokens || 0;
-          totalCache += bucket.cache_read_input_tokens || 0;
+        if (lim.nextResetTime) {
+          const diff = lim.nextResetTime - Date.now();
+          const days = Math.floor(diff / 86400000);
+          const hours = Math.floor((diff % 86400000) / 3600000);
+          console.log(`    ${c.dim}리셋${c.reset} ${new Date(lim.nextResetTime).toLocaleString('ko-KR')} ${c.dim}(${days}일 ${hours}시간 후)${c.reset}`);
         }
-        console.log(`    입력:      ${c.bold}${fmtTokens(totalInput)}${c.reset} 토큰`);
-        console.log(`    출력:      ${c.bold}${fmtTokens(totalOutput)}${c.reset} 토큰`);
-        console.log(`    캐시 읽기: ${c.bold}${fmtTokens(totalCache)}${c.reset} 토큰`);
-        console.log(`    합계:      ${c.bold}${fmtTokens(totalInput + totalOutput)}${c.reset} 토큰`);
-      }
-      // 일반 필드 표시
-      else {
-        const knownKeys = ['balance', 'credits', 'remaining', 'usage', 'total_usage', 'used',
-          'quota', 'plan', 'subscription', 'tokens_used', 'tokens_remaining', 'total_tokens',
-          'total_cost', 'amount', 'currency'];
-        const shown = new Set();
-        for (const k of knownKeys) {
-          if (data[k] !== undefined) {
-            const val = typeof data[k] === 'object' ? JSON.stringify(data[k]) : data[k];
-            console.log(`    ${c.bold}${k}${c.reset}: ${val}`);
-            shown.add(k);
-          }
-        }
-        for (const [k, v] of Object.entries(data)) {
-          if (shown.has(k)) continue;
-          const val = typeof v === 'object' ? JSON.stringify(v).slice(0, 100) : v;
-          console.log(`    ${c.dim}${k}${c.reset}: ${val}`);
+        if (lim.usageDetails?.length) {
+          const active = lim.usageDetails.filter(d => d.usage > 0);
+          if (active.length) console.log(`    ${c.dim}상세${c.reset} ${active.map(d => `${d.modelCode} ${c.bold}${d.usage}${c.reset}`).join('  ')}`);
         }
       }
-    } else {
-      console.log(`    ${data}`);
+    }
+
+    // — 모델별 사용량 (최근 7일) —
+    if (result.modelUsage?.totalUsage) {
+      const mu = result.modelUsage;
+      const total = mu.totalUsage;
+      console.log(`\n  ${c.cyan}◆ 모델 사용량 (7일)${c.reset}`);
+      console.log(`    호출 ${c.bold}${fmtTokens(total.totalModelCallCount)}${c.reset}회  토큰 ${c.bold}${fmtTokens(total.totalTokensUsage)}${c.reset}`);
+      // 일별 요약
+      if (mu.x_time && mu.modelCallCount) {
+        const daily = {};
+        for (let i = 0; i < mu.x_time.length; i++) {
+          const day = mu.x_time[i].slice(0, 10);
+          if (!daily[day]) daily[day] = { calls: 0, tokens: 0 };
+          daily[day].calls += mu.modelCallCount[i] || 0;
+          daily[day].tokens += mu.tokensUsage[i] || 0;
+        }
+        const maxTokens = Math.max(...Object.values(daily).map(d => d.tokens), 1);
+        for (const [day, d] of Object.entries(daily)) {
+          const barLen = Math.round(16 * d.tokens / maxTokens);
+          const bar = `${c.cyan}${'▪'.repeat(barLen)}${c.reset}`;
+          console.log(`    ${c.dim}${day.slice(5)}${c.reset} ${bar} ${fmtTokens(d.tokens)} ${c.dim}(${d.calls}회)${c.reset}`);
+        }
+      }
+    }
+
+    // — 도구 사용량 (최근 7일) —
+    if (result.toolUsage?.totalUsage) {
+      const tu = result.toolUsage.totalUsage;
+      const details = tu.toolDetails || [];
+      const totalSearch = tu.totalSearchMcpCount || 0;
+      if (totalSearch > 0 || details.length > 0) {
+        console.log(`\n  ${c.cyan}◆ 도구 사용량 (7일)${c.reset}`);
+        console.log(`    검색 ${c.bold}${tu.totalNetworkSearchCount || 0}${c.reset}  웹읽기 ${c.bold}${tu.totalWebReadMcpCount || 0}${c.reset}  zread ${c.bold}${tu.totalZreadMcpCount || 0}${c.reset}  합계 ${c.bold}${totalSearch}${c.reset}`);
+      }
     }
     console.log('');
   } else {
-    spinner.fail('사용량 API 접근 불가');
-    if (provider === 'anthropic') {
-      console.log(`  ${c.dim}Anthropic Admin API 키(sk-ant-admin...)가 필요합니다.${c.reset}`);
-    } else if (provider === 'openai') {
-      console.log(`  ${c.dim}OpenAI 조직 API 키가 필요할 수 있습니다.${c.reset}`);
-    }
-    if (dashboardUrl) {
-      console.log(`  ${c.dim}대시보드: ${dashboardUrl}${c.reset}`);
-    }
-    console.log('');
+    spinner.fail('사용량 API 접근 실패');
+    console.log(`  ${c.dim}JWT가 만료되었거나 네트워크 오류일 수 있습니다.${c.reset}`);
+    console.log(`  ${c.dim}대시보드: ${dashboardUrl}${c.reset}\n`);
   }
 
   // 3. 로컬 세션 사용량 요약
