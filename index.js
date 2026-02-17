@@ -805,22 +805,11 @@ async function fetchApiUsage() {
     }
   }
 
-  // ZhipuAI / 일반: 비공식 탐색
+  // 일반/OpenAI 호환: 비공식 탐색 (최소한의 후보만)
   const genericPaths = [
     CFG.apiPrefix + '/usage',
-    CFG.apiPrefix + '/billing/usage',
-    CFG.apiPrefix + '/balance',
-    CFG.apiPrefix + '/account',
-    CFG.apiPrefix + '/quota',
     CFG.apiPrefix + '/dashboard/billing/usage',
     CFG.apiPrefix + '/dashboard/billing/subscription',
-    CFG.apiPrefix + '/dashboard/billing/credit_grants',
-    '/api/paas/v4/usage',
-    '/api/paas/v4/balance',
-    '/api/paas/v4/finance/balance',
-    '/api/user/usage',
-    '/api/user/balance',
-    '/api/user/finance',
   ];
   for (const p of genericPaths) {
     try {
