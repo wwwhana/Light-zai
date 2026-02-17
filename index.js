@@ -2792,28 +2792,48 @@ async function cmdAccount() {
     console.log(`  ${c.dim}설정: LZAI_JWT="eyJ..." 또는 /config jwt <토큰>${c.reset}\n`);
   } else if (result && result.data) {
     spinner.succeed(`사용량 조회 성공 (${result.host})`);
-    console.log(`    ${c.dim}${result.path}${c.reset}\n`);
-    const data = result.data;
-    // 알려진 필드 우선 표시
-    const knownKeys = ['balance', 'credits', 'remaining', 'usage', 'total_usage', 'used',
-      'quota', 'limit', 'plan', 'tokens_used', 'tokens_remaining', 'total_tokens',
-      'total_cost', 'amount', 'currency'];
-    const shown = new Set();
-    if (typeof data === 'object') {
-      for (const k of knownKeys) {
-        if (data[k] !== undefined) {
-          const val = typeof data[k] === 'object' ? JSON.stringify(data[k]) : data[k];
-          console.log(`    ${c.bold}${k}${c.reset}: ${val}`);
-          shown.add(k);
+    const raw = result.data;
+    const d = raw.data || raw; // { limits: [...], level }
+    const limits = d.limits || [];
+    const level = d.level;
+
+    if (level) console.log(`    ${c.dim}등급${c.reset} ${c.bold}${level}${c.reset}`);
+
+    const LIMIT_LABEL = { TIME_LIMIT: '요청 한도', TOKENS_LIMIT: '토큰 한도' };
+    for (const lim of limits) {
+      const label = LIMIT_LABEL[lim.type] || lim.type;
+      console.log(`\n  ${c.cyan}◆ ${label}${c.reset}`);
+
+      if (lim.usage !== undefined && lim.remaining !== undefined) {
+        const used = lim.currentValue || (lim.usage - lim.remaining);
+        const pct = lim.percentage || 0;
+        const barLen = 20;
+        const filled = Math.round(barLen * pct / 100);
+        const bar = `${c.green}${'█'.repeat(filled)}${c.dim}${'░'.repeat(barLen - filled)}${c.reset}`;
+        console.log(`    ${bar} ${c.bold}${used}${c.reset}/${lim.usage} ${c.dim}(${pct}%)${c.reset}`);
+        console.log(`    ${c.dim}잔여${c.reset} ${c.bold}${lim.remaining}${c.reset}`);
+      } else if (lim.percentage !== undefined) {
+        const pct = lim.percentage;
+        const barLen = 20;
+        const filled = Math.round(barLen * pct / 100);
+        const bar = `${c.green}${'█'.repeat(filled)}${c.dim}${'░'.repeat(barLen - filled)}${c.reset}`;
+        console.log(`    ${bar} ${c.bold}${pct}%${c.reset} 사용`);
+      }
+
+      if (lim.nextResetTime) {
+        const resetDate = new Date(lim.nextResetTime);
+        const diff = lim.nextResetTime - Date.now();
+        const days = Math.floor(diff / 86400000);
+        const hours = Math.floor((diff % 86400000) / 3600000);
+        console.log(`    ${c.dim}리셋${c.reset} ${resetDate.toLocaleString('ko-KR')} ${c.dim}(${days}일 ${hours}시간 후)${c.reset}`);
+      }
+
+      if (lim.usageDetails && lim.usageDetails.length > 0) {
+        const active = lim.usageDetails.filter(d => d.usage > 0);
+        if (active.length > 0) {
+          console.log(`    ${c.dim}모델별${c.reset} ${active.map(d => `${d.modelCode} ${c.bold}${d.usage}${c.reset}`).join('  ')}`);
         }
       }
-      for (const [k, v] of Object.entries(data)) {
-        if (shown.has(k)) continue;
-        const val = typeof v === 'object' ? JSON.stringify(v).slice(0, 120) : v;
-        console.log(`    ${c.dim}${k}${c.reset}: ${val}`);
-      }
-    } else {
-      console.log(`    ${data}`);
     }
     console.log('');
   } else {
