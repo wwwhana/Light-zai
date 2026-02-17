@@ -745,6 +745,16 @@ function detectRegion() {
   return 'global';
 }
 
+// Z.AI JWT 요청 헬퍼
+function zaiGet(host, path, jwt) {
+  return httpRequest({
+    hostname: host, port: 443, protocol: 'https:',
+    path, method: 'GET',
+    headers: { 'Authorization': `Bearer ${jwt}`, 'Accept': 'application/json' },
+    timeout: 15000,
+  });
+}
+
 // Z.AI 사용량 조회 (웹 대시보드 JWT 필요)
 async function fetchApiUsage() {
   const jwt = CFG.jwt;
@@ -752,25 +762,32 @@ async function fetchApiUsage() {
 
   const region = detectRegion();
   const host = region === 'cn' ? 'open.bigmodel.cn' : 'api.z.ai';
-  const endpoints = [
-    '/api/monitor/usage/quota/limit',
-    '/api/monitor/usage/quota',
-    '/api/monitor/usage',
-  ];
-  for (const p of endpoints) {
-    try {
-      debugLog(`Z.AI 사용량 조회 (${host}):`, p);
-      const opts = {
-        hostname: host, port: 443, protocol: 'https:',
-        path: p, method: 'GET',
-        headers: { 'Authorization': `Bearer ${jwt}`, 'Accept': 'application/json' },
-        timeout: 15000,
-      };
-      const res = await httpRequest(opts);
-      if (res && typeof res === 'object') return { path: p, data: res, host };
-    } catch (_) {}
-  }
-  return null;
+  const result = { host };
+
+  // 1) 쿼터/한도
+  try {
+    const res = await zaiGet(host, '/api/monitor/usage/quota/limit', jwt);
+    if (res?.success || res?.code === 200) result.quota = (res.data || res);
+  } catch (_) {}
+
+  // 2) 모델별 사용량 (최근 7일)
+  const now = new Date();
+  const weekAgo = new Date(now.getTime() - 7 * 86400000);
+  const startTime = encodeURIComponent(weekAgo.toISOString().slice(0, 10) + ' 00:00:00');
+  const endTime = encodeURIComponent(now.toISOString().slice(0, 10) + ' 23:59:59');
+  try {
+    const res = await zaiGet(host, `/api/monitor/usage/model-usage?startTime=${startTime}&endTime=${endTime}`, jwt);
+    if (res?.success || res?.code === 200) result.modelUsage = (res.data || res);
+  } catch (_) {}
+
+  // 3) 도구 사용량 (최근 7일)
+  try {
+    const res = await zaiGet(host, `/api/monitor/usage/tool-usage?startTime=${startTime}&endTime=${endTime}`, jwt);
+    if (res?.success || res?.code === 200) result.toolUsage = (res.data || res);
+  } catch (_) {}
+
+  if (!result.quota && !result.modelUsage && !result.toolUsage) return null;
+  return result;
 }
 
 // ===== API 요청 헬퍼 =====
@@ -2790,49 +2807,71 @@ async function cmdAccount() {
     spinner.fail('JWT 토큰 필요');
     console.log(`  ${c.dim}z.ai 로그인 → 개발자 도구 → Network → Authorization 헤더의 JWT 복사${c.reset}`);
     console.log(`  ${c.dim}설정: LZAI_JWT="eyJ..." 또는 /config jwt <토큰>${c.reset}\n`);
-  } else if (result && result.data) {
+  } else if (result && (result.quota || result.modelUsage || result.toolUsage)) {
     spinner.succeed(`사용량 조회 성공 (${result.host})`);
-    const raw = result.data;
-    const d = raw.data || raw; // { limits: [...], level }
-    const limits = d.limits || [];
-    const level = d.level;
 
-    if (level) console.log(`    ${c.dim}등급${c.reset} ${c.bold}${level}${c.reset}`);
-
-    const LIMIT_LABEL = { TIME_LIMIT: '요청 한도', TOKENS_LIMIT: '토큰 한도' };
-    for (const lim of limits) {
-      const label = LIMIT_LABEL[lim.type] || lim.type;
-      console.log(`\n  ${c.cyan}◆ ${label}${c.reset}`);
-
-      if (lim.usage !== undefined && lim.remaining !== undefined) {
-        const used = lim.currentValue || (lim.usage - lim.remaining);
-        const pct = lim.percentage || 0;
-        const barLen = 20;
-        const filled = Math.round(barLen * pct / 100);
-        const bar = `${c.green}${'█'.repeat(filled)}${c.dim}${'░'.repeat(barLen - filled)}${c.reset}`;
-        console.log(`    ${bar} ${c.bold}${used}${c.reset}/${lim.usage} ${c.dim}(${pct}%)${c.reset}`);
-        console.log(`    ${c.dim}잔여${c.reset} ${c.bold}${lim.remaining}${c.reset}`);
-      } else if (lim.percentage !== undefined) {
-        const pct = lim.percentage;
-        const barLen = 20;
-        const filled = Math.round(barLen * pct / 100);
-        const bar = `${c.green}${'█'.repeat(filled)}${c.dim}${'░'.repeat(barLen - filled)}${c.reset}`;
-        console.log(`    ${bar} ${c.bold}${pct}%${c.reset} 사용`);
-      }
-
-      if (lim.nextResetTime) {
-        const resetDate = new Date(lim.nextResetTime);
-        const diff = lim.nextResetTime - Date.now();
-        const days = Math.floor(diff / 86400000);
-        const hours = Math.floor((diff % 86400000) / 3600000);
-        console.log(`    ${c.dim}리셋${c.reset} ${resetDate.toLocaleString('ko-KR')} ${c.dim}(${days}일 ${hours}시간 후)${c.reset}`);
-      }
-
-      if (lim.usageDetails && lim.usageDetails.length > 0) {
-        const active = lim.usageDetails.filter(d => d.usage > 0);
-        if (active.length > 0) {
-          console.log(`    ${c.dim}모델별${c.reset} ${active.map(d => `${d.modelCode} ${c.bold}${d.usage}${c.reset}`).join('  ')}`);
+    // — 쿼터/한도 —
+    if (result.quota) {
+      const q = result.quota;
+      if (q.level) console.log(`    ${c.dim}등급${c.reset} ${c.bold}${q.level}${c.reset}`);
+      const LIMIT_LABEL = { TIME_LIMIT: '요청 한도', TOKENS_LIMIT: '토큰 한도' };
+      for (const lim of (q.limits || [])) {
+        const label = LIMIT_LABEL[lim.type] || lim.type;
+        console.log(`\n  ${c.cyan}◆ ${label}${c.reset}`);
+        if (lim.usage !== undefined && lim.remaining !== undefined) {
+          const used = lim.currentValue || (lim.usage - lim.remaining);
+          const pct = lim.percentage || 0;
+          const filled = Math.round(20 * pct / 100);
+          console.log(`    ${c.green}${'█'.repeat(filled)}${c.dim}${'░'.repeat(20 - filled)}${c.reset} ${c.bold}${used}${c.reset}/${lim.usage} ${c.dim}(${pct}%)${c.reset}  잔여 ${c.bold}${lim.remaining}${c.reset}`);
+        } else if (lim.percentage !== undefined) {
+          const filled = Math.round(20 * lim.percentage / 100);
+          console.log(`    ${c.green}${'█'.repeat(filled)}${c.dim}${'░'.repeat(20 - filled)}${c.reset} ${c.bold}${lim.percentage}%${c.reset} 사용`);
         }
+        if (lim.nextResetTime) {
+          const diff = lim.nextResetTime - Date.now();
+          const days = Math.floor(diff / 86400000);
+          const hours = Math.floor((diff % 86400000) / 3600000);
+          console.log(`    ${c.dim}리셋${c.reset} ${new Date(lim.nextResetTime).toLocaleString('ko-KR')} ${c.dim}(${days}일 ${hours}시간 후)${c.reset}`);
+        }
+        if (lim.usageDetails?.length) {
+          const active = lim.usageDetails.filter(d => d.usage > 0);
+          if (active.length) console.log(`    ${c.dim}상세${c.reset} ${active.map(d => `${d.modelCode} ${c.bold}${d.usage}${c.reset}`).join('  ')}`);
+        }
+      }
+    }
+
+    // — 모델별 사용량 (최근 7일) —
+    if (result.modelUsage?.totalUsage) {
+      const mu = result.modelUsage;
+      const total = mu.totalUsage;
+      console.log(`\n  ${c.cyan}◆ 모델 사용량 (7일)${c.reset}`);
+      console.log(`    호출 ${c.bold}${fmtTokens(total.totalModelCallCount)}${c.reset}회  토큰 ${c.bold}${fmtTokens(total.totalTokensUsage)}${c.reset}`);
+      // 일별 요약
+      if (mu.x_time && mu.modelCallCount) {
+        const daily = {};
+        for (let i = 0; i < mu.x_time.length; i++) {
+          const day = mu.x_time[i].slice(0, 10);
+          if (!daily[day]) daily[day] = { calls: 0, tokens: 0 };
+          daily[day].calls += mu.modelCallCount[i] || 0;
+          daily[day].tokens += mu.tokensUsage[i] || 0;
+        }
+        const maxTokens = Math.max(...Object.values(daily).map(d => d.tokens), 1);
+        for (const [day, d] of Object.entries(daily)) {
+          const barLen = Math.round(16 * d.tokens / maxTokens);
+          const bar = `${c.cyan}${'▪'.repeat(barLen)}${c.reset}`;
+          console.log(`    ${c.dim}${day.slice(5)}${c.reset} ${bar} ${fmtTokens(d.tokens)} ${c.dim}(${d.calls}회)${c.reset}`);
+        }
+      }
+    }
+
+    // — 도구 사용량 (최근 7일) —
+    if (result.toolUsage?.totalUsage) {
+      const tu = result.toolUsage.totalUsage;
+      const details = tu.toolDetails || [];
+      const totalSearch = tu.totalSearchMcpCount || 0;
+      if (totalSearch > 0 || details.length > 0) {
+        console.log(`\n  ${c.cyan}◆ 도구 사용량 (7일)${c.reset}`);
+        console.log(`    검색 ${c.bold}${tu.totalNetworkSearchCount || 0}${c.reset}  웹읽기 ${c.bold}${tu.totalWebReadMcpCount || 0}${c.reset}  zread ${c.bold}${tu.totalZreadMcpCount || 0}${c.reset}  합계 ${c.bold}${totalSearch}${c.reset}`);
       }
     }
     console.log('');
