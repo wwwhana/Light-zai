@@ -104,6 +104,7 @@ const CFG = {
   temperature:parseFloat(process.env.LZAI_TEMPERATURE || savedCfg.temperature || DEFAULT_CONFIG.temperature),
   jsonMode:   false,
   autoApprove: process.env.LZAI_AUTO_APPROVE === '1', // 도구 자동 승인 (기본: 꺼짐)
+  jwt:        process.env.LZAI_JWT || '', // 웹 대시보드 JWT (Z.AI 사용량 조회용)
 };
 
 // ===== 전역 상태 =====
@@ -739,7 +740,7 @@ function captureApiHeaders(headers) {
 // API 제공자 감지
 function detectProvider() {
   const host = CFG.baseUrl.toLowerCase();
-  if (host.includes('openai') || host.includes('api.openai.com')) return 'openai';
+  if (host.includes('openai') || host.includes('chatgpt')) return 'openai';
   if (host.includes('anthropic') || host.includes('claude')) return 'anthropic';
   if (host.includes('z.ai') || host.includes('bigmodel')) return 'zhipu';
   return 'unknown';
@@ -805,7 +806,33 @@ async function fetchApiUsage() {
     }
   }
 
-  // 일반/OpenAI 호환: 비공식 탐색 (최소한의 후보만)
+  // ZhipuAI/Z.AI: 웹 대시보드 JWT 기반 사용량 조회
+  if (provider === 'zhipu') {
+    const jwt = CFG.jwt;
+    if (jwt) {
+      const zaiEndpoints = [
+        '/api/monitor/usage/quota/limit',
+        '/api/monitor/usage/quota',
+        '/api/monitor/usage',
+      ];
+      for (const p of zaiEndpoints) {
+        try {
+          debugLog('Z.AI JWT 사용량 조회:', p);
+          const opts = {
+            hostname: 'api.z.ai', port: 443, protocol: 'https:',
+            path: p, method: 'GET',
+            headers: { 'Authorization': `Bearer ${jwt}`, 'Accept': 'application/json' },
+            timeout: 15000,
+          };
+          const res = await httpRequest(opts);
+          if (res && typeof res === 'object') return { provider: 'Z.AI', path: p, data: res };
+        } catch (_) {}
+      }
+    }
+    return { provider: 'Z.AI', path: null, data: null, needJwt: !jwt };
+  }
+
+  // 일반/OpenAI 호환: 비공식 탐색
   const genericPaths = [
     CFG.apiPrefix + '/usage',
     CFG.apiPrefix + '/dashboard/billing/usage',
@@ -817,7 +844,7 @@ async function fetchApiUsage() {
       const res = await apiGet(p);
       if (res && typeof res === 'object') {
         debugLog('사용량 응답:', JSON.stringify(res).slice(0, 500));
-        return { provider: provider === 'zhipu' ? 'ZhipuAI' : CFG.baseUrl, path: p, data: res };
+        return { provider: CFG.baseUrl, path: p, data: res };
       }
     } catch (_) {}
   }
@@ -2842,7 +2869,12 @@ async function cmdAccount() {
   // 2. 제공자 사용량 API 조회
   const spinner = createSpinner(`${providerName} 사용량 API 조회`).start();
   const result = await fetchApiUsage();
-  if (result) {
+  if (result && result.needJwt) {
+    spinner.fail('Z.AI 사용량 API: 웹 JWT 토큰 필요');
+    console.log(`  ${c.dim}엔드포인트: api.z.ai/api/monitor/usage/quota/limit${c.reset}`);
+    console.log(`  ${c.dim}브라우저에서 z.ai 로그인 → 개발자 도구 → Network → Authorization 헤더의 JWT 복사${c.reset}`);
+    console.log(`  ${c.dim}설정: LZAI_JWT="eyJ..." 또는 /config jwt <토큰>${c.reset}\n`);
+  } else if (result && result.data) {
     spinner.succeed(`${result.provider || providerName} 사용량 조회 성공`);
     console.log(`    ${c.dim}엔드포인트: ${result.path}${c.reset}\n`);
     const data = result.data;
@@ -2901,7 +2933,7 @@ async function cmdAccount() {
       console.log(`    ${data}`);
     }
     console.log('');
-  } else {
+  } else if (!result || !result.needJwt) {
     spinner.fail('사용량 API 접근 불가');
     if (provider === 'anthropic') {
       console.log(`  ${c.dim}Anthropic Admin API 키(sk-ant-admin...)가 필요합니다.${c.reset}`);
