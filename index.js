@@ -751,7 +751,7 @@ async function fetchApiUsage() {
   const now = new Date();
   const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
 
-  // OpenAI: /v1/organization/usage/completions
+  // OpenAI: /v1/organization/usage/completions + chatgpt.com 비공식
   if (provider === 'openai') {
     const startSec = Math.floor(weekAgo.getTime() / 1000);
     const endpoints = [
@@ -767,6 +767,18 @@ async function fetchApiUsage() {
         if (res && typeof res === 'object') return { provider: 'OpenAI', path: p, data: res };
       } catch (_) {}
     }
+    // chatgpt.com 비공식 엔드포인트
+    try {
+      debugLog('ChatGPT 사용량 조회: /backend-api/wham/usage');
+      const opts = {
+        hostname: 'chatgpt.com', port: 443, protocol: 'https:',
+        path: '/backend-api/wham/usage', method: 'GET',
+        headers: { 'Authorization': `Bearer ${CFG.apiKey}`, 'Accept': 'application/json' },
+        timeout: 15000,
+      };
+      const res = await httpRequest(opts);
+      if (res && typeof res === 'object') return { provider: 'ChatGPT', path: 'chatgpt.com/backend-api/wham/usage', data: res };
+    } catch (_) {}
   }
 
   // Anthropic: /v1/organizations/usage_report/messages (Admin API 키 필요)
