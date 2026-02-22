@@ -29,6 +29,12 @@ jobs:
           - goos: linux
             goarch: arm64
             out: light-zai-go-linux-arm64
+          - goos: darwin
+            goarch: amd64
+            out: light-zai-go-darwin-amd64
+          - goos: darwin
+            goarch: arm64
+            out: light-zai-go-darwin-arm64
     steps:
       - uses: actions/checkout@v4
         with:
@@ -65,3 +71,5 @@ jobs:
             - light-zai-go-linux-amd64
             - light-zai-go-linux-armv7
             - light-zai-go-linux-arm64
+            - light-zai-go-darwin-amd64
+            - light-zai-go-darwin-arm64

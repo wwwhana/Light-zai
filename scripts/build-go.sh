@@ -20,5 +20,7 @@ build() {
 build linux amd64 "" linux-amd64
 build linux arm 7 linux-armv7
 build linux arm64 "" linux-arm64
+build darwin amd64 "" darwin-amd64
+build darwin arm64 "" darwin-arm64
 
 ls -lh "$OUT_DIR"
