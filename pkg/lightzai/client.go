@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -35,6 +36,32 @@ type Message struct {
 type Client struct {
 	cfg        Config
 	httpClient *http.Client
+}
+
+type savedConfig struct {
+	APIKey      string  `json:"apiKey"`
+	Model       string  `json:"model"`
+	BaseURL     string  `json:"baseUrl"`
+	APIPrefix   string  `json:"apiPrefix"`
+	MaxTokens   int     `json:"maxTokens"`
+	Temperature float64 `json:"temperature"`
+}
+
+func loadSavedConfig() savedConfig {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return savedConfig{}
+	}
+	p := filepath.Join(home, ".config", "light-zai", "config.json")
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return savedConfig{}
+	}
+	var cfg savedConfig
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		return savedConfig{}
+	}
+	return cfg
 }
 
 func envInt(name string, def int) int {
@@ -109,29 +136,50 @@ func dynamicMaxHistory(totalMemMB int) int {
 }
 
 func DefaultConfigFromEnv() Config {
+	saved := loadSavedConfig()
 	apiKey := os.Getenv("ZAI_API_KEY")
 	if apiKey == "" {
 		apiKey = os.Getenv("LZAI_API_KEY")
 	}
+	if apiKey == "" {
+		apiKey = saved.APIKey
+	}
 	model := os.Getenv("LZAI_MODEL")
+	if model == "" {
+		model = saved.Model
+	}
 	if model == "" {
 		model = "glm-5"
 	}
 	base := os.Getenv("LZAI_BASE_URL")
 	if base == "" {
+		base = saved.BaseURL
+	}
+	if base == "" {
 		base = "api.z.ai"
 	}
 	prefix := os.Getenv("LZAI_API_PREFIX")
+	if prefix == "" {
+		prefix = saved.APIPrefix
+	}
 	if prefix == "" {
 		prefix = "/api/paas/v4"
 	}
 
 	totalMemMB := detectTotalMemoryMB()
-	maxTokens := envInt("LZAI_MAX_TOKENS", dynamicTokenLimit(totalMemMB))
+	defaultTokens := dynamicTokenLimit(totalMemMB)
+	if saved.MaxTokens > 0 {
+		defaultTokens = saved.MaxTokens
+	}
+	maxTokens := envInt("LZAI_MAX_TOKENS", defaultTokens)
 	if maxTokens <= 0 {
 		maxTokens = dynamicTokenLimit(totalMemMB)
 	}
-	temp := envFloat("LZAI_TEMPERATURE", 0.7)
+	defaultTemp := 0.7
+	if saved.Temperature > 0 {
+		defaultTemp = saved.Temperature
+	}
+	temp := envFloat("LZAI_TEMPERATURE", defaultTemp)
 	if temp < 0 {
 		temp = 0
 	}
@@ -324,7 +372,15 @@ func RunREPL(ctx context.Context, c *Client) error {
 
 		ans, err := c.Chat(ctx, history)
 		if err != nil {
-			fmt.Println("error>", err)
+			errMsg := err.Error()
+			lower := strings.ToLower(errMsg)
+			if strings.Contains(lower, "insufficient balance") || strings.Contains(lower, "no resource package") {
+				fmt.Println("error> 크레딧/리소스 패키지가 부족합니다.")
+				fmt.Println("hint> ZAI 콘솔에서 잔액/패키지를 충전한 뒤 다시 시도하세요.")
+				fmt.Println("hint> 키/엔드포인트 점검: ZAI_API_KEY, LZAI_BASE_URL, LZAI_API_PREFIX")
+			} else {
+				fmt.Println("error>", errMsg)
+			}
 			continue
 		}
 		fmt.Println("ai>")
