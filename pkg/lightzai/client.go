@@ -307,12 +307,16 @@ func wrapText(s string, width int) []string {
 	}
 	var out []string
 	for _, rawLine := range strings.Split(s, "\n") {
-		line := rawLine
-		for len(line) > width {
-			out = append(out, line[:width])
-			line = line[width:]
+		runes := []rune(rawLine)
+		if len(runes) == 0 {
+			out = append(out, "")
+			continue
 		}
-		out = append(out, line)
+		for len(runes) > width {
+			out = append(out, string(runes[:width]))
+			runes = runes[width:]
+		}
+		out = append(out, string(runes))
 	}
 	if len(out) == 0 {
 		return []string{""}
