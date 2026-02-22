@@ -20,7 +20,10 @@ func main() {
 	ctx := context.Background()
 	if len(os.Args) > 1 {
 		q := strings.TrimSpace(strings.Join(os.Args[1:], " "))
-		ans, err := cli.Chat(ctx, []lightzai.Message{{Role: "user", Content: q}})
+		ans, err := cli.Chat(ctx, []lightzai.Message{
+			{Role: "system", Content: cli.SystemPrompt()},
+			{Role: "user", Content: q},
+		})
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "API 오류:", err)
 			os.Exit(1)

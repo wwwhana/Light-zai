@@ -38,6 +38,8 @@ type Client struct {
 	httpClient *http.Client
 }
 
+const defaultSystemPrompt = "당신은 간결하고 정확한 코딩 도우미입니다."
+
 type savedConfig struct {
 	APIKey      string  `json:"apiKey"`
 	Model       string  `json:"model"`
@@ -238,6 +240,10 @@ func NewClient(cfg Config) (*Client, error) {
 	}, nil
 }
 
+func (c *Client) SystemPrompt() string {
+	return defaultSystemPrompt
+}
+
 type chatRequest struct {
 	Model       string    `json:"model"`
 	Messages    []Message `json:"messages"`
@@ -349,7 +355,7 @@ func RunREPL(ctx context.Context, c *Client) error {
 	fmt.Println("Light-zai Go (ARMv7/저메모리) — 종료: /exit, 초기화: /clear")
 	s := bufio.NewScanner(os.Stdin)
 	s.Buffer(make([]byte, 0, 4096), 1024*1024)
-	history := []Message{{Role: "system", Content: "당신은 간결하고 정확한 코딩 도우미입니다."}}
+	history := []Message{{Role: "system", Content: c.SystemPrompt()}}
 	for {
 		fmt.Print("you> ")
 		if !s.Scan() {
