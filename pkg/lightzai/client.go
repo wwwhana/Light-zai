@@ -10,9 +10,12 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
+	"unsafe"
 )
 
 type Config struct {
@@ -366,9 +369,46 @@ func isTTYDevice(f *os.File) bool {
 	return (st.Mode() & os.ModeCharDevice) != 0
 }
 
+type ttyWinSize struct {
+	Row    uint16
+	Col    uint16
+	Xpixel uint16
+	Ypixel uint16
+}
+
+func terminalSizeFromIOCTL(f *os.File) (int, int, bool) {
+	if f == nil {
+		return 0, 0, false
+	}
+	fd := f.Fd()
+	if fd == 0 {
+		return 0, 0, false
+	}
+	var req uintptr
+	switch runtime.GOOS {
+	case "linux":
+		req = 0x5413 // TIOCGWINSZ
+	case "darwin":
+		req = 0x40087468 // TIOCGWINSZ
+	default:
+		return 0, 0, false
+	}
+	var ws ttyWinSize
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, req, uintptr(unsafe.Pointer(&ws)))
+	if errno != 0 || ws.Col == 0 || ws.Row == 0 {
+		return 0, 0, false
+	}
+	return int(ws.Col), int(ws.Row), true
+}
+
 func detectTermSize(defaultW, defaultH int) (int, int) {
-	w := envInt("COLUMNS", defaultW)
-	h := envInt("LINES", defaultH)
+	w, h := 0, 0
+	if cw, ch, ok := terminalSizeFromIOCTL(os.Stdout); ok {
+		w, h = cw, ch
+	} else {
+		w = envInt("COLUMNS", defaultW)
+		h = envInt("LINES", defaultH)
+	}
 	if w < 20 {
 		w = defaultW
 		if w < 20 {
@@ -384,11 +424,8 @@ func detectTermSize(defaultW, defaultH int) (int, int) {
 	return w, h
 }
 
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
+func runeLen(s string) int {
+	return len([]rune(s))
 }
 
 func transcriptLines(transcript []Message, width int) []string {
@@ -404,13 +441,20 @@ func transcriptLines(transcript []Message, width int) []string {
 		case "system":
 			prefix = "sys>"
 		}
-		wrapped := wrapText(strings.TrimSpace(m.Content), width)
-		if len(wrapped) == 0 {
+		firstWidth := width - runeLen(prefix) - 1
+		if firstWidth < 8 {
+			firstWidth = 8
+		}
+		raw := strings.TrimSpace(m.Content)
+		firstWrapped := wrapText(raw, firstWidth)
+		if len(firstWrapped) == 0 {
 			continue
 		}
-		out = append(out, prefix+" "+wrapped[0])
-		for _, ln := range wrapped[1:] {
-			out = append(out, "    "+ln)
+		out = append(out, prefix+" "+firstWrapped[0])
+		if len(firstWrapped) > 1 {
+			for _, ln := range firstWrapped[1:] {
+				out = append(out, "    "+ln)
+			}
 		}
 	}
 	return out
@@ -419,8 +463,12 @@ func transcriptLines(transcript []Message, width int) []string {
 func renderTUI(c *Client, transcript []Message, status string, width, height int) {
 	fmt.Print("\033[2J\033[H")
 	title := fmt.Sprintf("Light-zai Go TUI | model=%s | /help /clear /exit", c.cfg.Model)
+	if runeLen(title) > width {
+		title = string([]rune(title)[:width])
+	}
+	border := strings.Repeat("─", width)
 	fmt.Println(title)
-	fmt.Println(strings.Repeat("-", minInt(width, len([]rune(title))+8)))
+	fmt.Println(border)
 	lines := transcriptLines(transcript, width)
 	bodyHeight := height - 6
 	if bodyHeight < 5 {
@@ -432,7 +480,7 @@ func renderTUI(c *Client, transcript []Message, status string, width, height int
 	for _, ln := range lines {
 		fmt.Println(ln)
 	}
-	fmt.Println(strings.Repeat("-", minInt(width, len([]rune(title))+8)))
+	fmt.Println(border)
 	if strings.TrimSpace(status) == "" {
 		status = "ready"
 	}
