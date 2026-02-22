@@ -355,8 +355,152 @@ func trimHistory(history []Message, max int) []Message {
 	return append([]Message{sys}, tail...)
 }
 
-func RunREPL(ctx context.Context, c *Client) error {
-	fmt.Println("Light-zai Go (ARMv7/저메모리) — 종료: /exit, 초기화: /clear")
+func isTTYDevice(f *os.File) bool {
+	if f == nil {
+		return false
+	}
+	st, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return (st.Mode() & os.ModeCharDevice) != 0
+}
+
+func detectTermSize(defaultW, defaultH int) (int, int) {
+	w := envInt("COLUMNS", defaultW)
+	h := envInt("LINES", defaultH)
+	if w < 20 {
+		w = defaultW
+		if w < 20 {
+			w = 20
+		}
+	}
+	if h < 8 {
+		h = defaultH
+		if h < 8 {
+			h = 8
+		}
+	}
+	return w, h
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func transcriptLines(transcript []Message, width int) []string {
+	var out []string
+	for _, m := range transcript {
+		role := strings.ToLower(strings.TrimSpace(m.Role))
+		prefix := role + ">"
+		switch role {
+		case "user":
+			prefix = "you>"
+		case "assistant":
+			prefix = "ai>"
+		case "system":
+			prefix = "sys>"
+		}
+		wrapped := wrapText(strings.TrimSpace(m.Content), width)
+		if len(wrapped) == 0 {
+			continue
+		}
+		out = append(out, prefix+" "+wrapped[0])
+		for _, ln := range wrapped[1:] {
+			out = append(out, "    "+ln)
+		}
+	}
+	return out
+}
+
+func renderTUI(c *Client, transcript []Message, status string, width, height int) {
+	fmt.Print("\033[2J\033[H")
+	title := fmt.Sprintf("Light-zai Go TUI | model=%s | /help /clear /exit", c.cfg.Model)
+	fmt.Println(title)
+	fmt.Println(strings.Repeat("-", minInt(width, len([]rune(title))+8)))
+	lines := transcriptLines(transcript, width)
+	bodyHeight := height - 6
+	if bodyHeight < 5 {
+		bodyHeight = 5
+	}
+	if len(lines) > bodyHeight {
+		lines = lines[len(lines)-bodyHeight:]
+	}
+	for _, ln := range lines {
+		fmt.Println(ln)
+	}
+	fmt.Println(strings.Repeat("-", minInt(width, len([]rune(title))+8)))
+	if strings.TrimSpace(status) == "" {
+		status = "ready"
+	}
+	fmt.Println("status:", status)
+}
+
+func runTUI(ctx context.Context, c *Client) error {
+	s := bufio.NewScanner(os.Stdin)
+	s.Buffer(make([]byte, 0, 4096), 1024*1024)
+	history := []Message{{Role: "system", Content: c.SystemPrompt()}}
+	var transcript []Message
+	status := "ready"
+	for {
+		w, h := detectTermSize(c.cfg.ScreenWidth, c.cfg.ScreenHeight)
+		renderTUI(c, transcript, status, w, h)
+		fmt.Print("you> ")
+		if !s.Scan() {
+			fmt.Println()
+			break
+		}
+		text := strings.TrimSpace(s.Text())
+		if text == "" {
+			continue
+		}
+		if text == "/exit" || text == "/quit" {
+			return nil
+		}
+		if text == "/clear" {
+			history = history[:1]
+			transcript = nil
+			status = "history cleared"
+			continue
+		}
+		if text == "/help" {
+			transcript = append(transcript, Message{Role: "system", Content: "명령: /help /clear /exit"})
+			status = "help"
+			continue
+		}
+
+		history = append(history, Message{Role: "user", Content: text})
+		history = trimHistory(history, c.cfg.MaxHistory)
+		transcript = append(transcript, Message{Role: "user", Content: text})
+		status = "waiting response..."
+		w, h = detectTermSize(c.cfg.ScreenWidth, c.cfg.ScreenHeight)
+		renderTUI(c, transcript, status, w, h)
+
+		ans, err := c.Chat(ctx, history)
+		if err != nil {
+			errMsg := err.Error()
+			lower := strings.ToLower(errMsg)
+			if strings.Contains(lower, "insufficient balance") || strings.Contains(lower, "no resource package") {
+				transcript = append(transcript, Message{Role: "system", Content: "크레딧/리소스 패키지가 부족합니다. 콘솔에서 충전 후 다시 시도하세요."})
+			} else {
+				transcript = append(transcript, Message{Role: "system", Content: "error> " + errMsg})
+			}
+			status = "request failed"
+			continue
+		}
+		transcript = append(transcript, Message{Role: "assistant", Content: ans})
+		history = append(history, Message{Role: "assistant", Content: ans})
+		history = trimHistory(history, c.cfg.MaxHistory)
+		status = "ready"
+	}
+	return s.Err()
+}
+
+func runLineREPL(ctx context.Context, c *Client) error {
+	fmt.Println("Light-zai Go (CLI) — 종료: /exit, 초기화: /clear")
 	s := bufio.NewScanner(os.Stdin)
 	s.Buffer(make([]byte, 0, 4096), 1024*1024)
 	history := []Message{{Role: "system", Content: c.SystemPrompt()}}
@@ -399,4 +543,18 @@ func RunREPL(ctx context.Context, c *Client) error {
 		history = trimHistory(history, c.cfg.MaxHistory)
 	}
 	return s.Err()
+}
+
+func RunREPL(ctx context.Context, c *Client) error {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("LZAI_UI")))
+	switch mode {
+	case "cli":
+		return runLineREPL(ctx, c)
+	case "tui":
+		return runTUI(ctx, c)
+	}
+	if isTTYDevice(os.Stdin) && isTTYDevice(os.Stdout) {
+		return runTUI(ctx, c)
+	}
+	return runLineREPL(ctx, c)
 }
