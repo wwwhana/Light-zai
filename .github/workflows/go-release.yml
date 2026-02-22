@@ -1,0 +1,67 @@
+name: go-release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.0.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            out: light-zai-go-linux-amd64
+          - goos: linux
+            goarch: arm
+            goarm: '7'
+            out: light-zai-go-linux-armv7
+          - goos: linux
+            goarch: arm64
+            out: light-zai-go-linux-arm64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: '0'
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags='-s -w' -o dist/${{ matrix.out }} ./cmd/light-zai
+      - name: Resolve release tag
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          files: dist/${{ matrix.out }}
+          fail_on_unmatched_files: true
+          append_body: true
+          body: |
+            Automated multi-arch build artifacts:
+            - light-zai-go-linux-amd64
+            - light-zai-go-linux-armv7
+            - light-zai-go-linux-arm64
