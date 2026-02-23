@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"syscall"
 	"unsafe"
@@ -327,12 +329,32 @@ func (c *Client) Chat(ctx context.Context, messages []Message) (string, error) {
 		return "", err
 	}
 	if out.Error != nil {
-		return "", fmt.Errorf(out.Error.Message)
+		return "", errors.New(out.Error.Message)
 	}
 	if len(out.Choices) == 0 {
-		return "", fmt.Errorf("empty response")
+		return "", errors.New("empty response")
 	}
 	return out.Choices[0].Message.Content, nil
+}
+
+func runeDisplayWidth(r rune) int {
+	if r == '	' {
+		return 4
+	}
+	if unicode.Is(unicode.Mn, r) || unicode.IsControl(r) {
+		return 0
+	}
+	if (r >= 0x1100 && r <= 0x115F) ||
+		(r >= 0x2E80 && r <= 0xA4CF) ||
+		(r >= 0xAC00 && r <= 0xD7A3) ||
+		(r >= 0xF900 && r <= 0xFAFF) ||
+		(r >= 0xFE10 && r <= 0xFE19) ||
+		(r >= 0xFE30 && r <= 0xFE6F) ||
+		(r >= 0xFF00 && r <= 0xFF60) ||
+		(r >= 0xFFE0 && r <= 0xFFE6) {
+		return 2
+	}
+	return 1
 }
 
 func wrapText(s string, width int) []string {
@@ -341,12 +363,23 @@ func wrapText(s string, width int) []string {
 	}
 	var out []string
 	for _, rawLine := range strings.Split(s, "\n") {
-		line := rawLine
-		for len(line) > width {
-			out = append(out, line[:width])
-			line = line[width:]
+		runes := []rune(rawLine)
+		if len(runes) == 0 {
+			out = append(out, "")
+			continue
 		}
-		out = append(out, line)
+		start := 0
+		lineWidth := 0
+		for i, r := range runes {
+			rw := runeDisplayWidth(r)
+			if lineWidth+rw > width {
+				out = append(out, string(runes[start:i]))
+				start = i
+				lineWidth = 0
+			}
+			lineWidth += rw
+		}
+		out = append(out, string(runes[start:]))
 	}
 	if len(out) == 0 {
 		return []string{""}
