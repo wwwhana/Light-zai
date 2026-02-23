@@ -38,15 +38,24 @@ go run ./cmd/light-zai "armv7에서 고루틴 스케줄러 특성 요약해줘"
 
 - 폭 기준 줄바꿈
 - 페이지 출력 (`--More--`)
+- 유니코드(한글/CJK) 문자 폭을 고려한 줄바꿈
 - `/clear`로 대화 기록 초기화
 
 긴 응답도 한 화면에 묻히지 않도록 설계되어 있습니다.
+
+## 온보딩 설정 (API 키 없이 시작 가능)
+
+`ZAI_API_KEY`/`LZAI_API_KEY`가 없어도 REPL이 실행되며, 시작 시 온보딩 프롬프트가 열립니다.
+
+- `/setup` 명령으로 언제든 재설정 가능
+- 입력값은 `~/.config/light-zai/config.json`에 저장
+- 첫 질문 전에도 설정 가능하도록 채팅 루프 안에서 동작
 
 ## 환경 변수
 
 | 변수 | 기본값 | 설명 |
 |---|---|---|
-| `ZAI_API_KEY` | *(필수)* | API 키 |
+| `ZAI_API_KEY` | 빈값 | API 키(없으면 REPL에서 `/setup` 온보딩으로 설정 가능) |
 | `LZAI_API_KEY` | 빈값 | `ZAI_API_KEY` 대체 키 |
 | `LZAI_MODEL` | `glm-5` | 모델명 |
 | `LZAI_BASE_URL` | `api.z.ai` | API 호스트 |
