@@ -476,26 +476,34 @@ func transcriptLines(transcript []Message, width int) []string {
 
 func renderTUI(c *Client, transcript []Message, status string, width, height int, showPrompt bool) {
 	fmt.Print("\033[2J\033[H")
+	if width < 24 {
+		width = 24
+	}
 	title := fmt.Sprintf("Light-zai Go TUI | model=%s | /help /clear /exit", c.cfg.Model)
-	border := strings.Repeat("─", width)
 	fmt.Println(fitToWidth(title, width))
-	fmt.Println(fitToWidth(border, width))
-	lines := transcriptLines(transcript, width)
-	bodyHeight := height - 5
-	if bodyHeight < 5 {
-		bodyHeight = 5
+	innerWidth := width - 4
+	if innerWidth < 8 {
+		innerWidth = 8
+	}
+	topBorder := "┌" + strings.Repeat("─", width-2) + "┐"
+	bottomBorder := "└" + strings.Repeat("─", width-2) + "┘"
+	fmt.Println(topBorder)
+	lines := transcriptLines(transcript, innerWidth)
+	bodyHeight := height - 6
+	if bodyHeight < 3 {
+		bodyHeight = 3
 	}
 	if len(lines) > bodyHeight {
 		lines = lines[len(lines)-bodyHeight:]
 	}
 	for i := 0; i < bodyHeight; i++ {
 		if i < len(lines) {
-			fmt.Println(fitToWidth(lines[i], width))
+			fmt.Println("│ " + fitToWidth(lines[i], innerWidth) + " │")
 		} else {
-			fmt.Println(strings.Repeat(" ", width))
+			fmt.Println("│ " + strings.Repeat(" ", innerWidth) + " │")
 		}
 	}
-	fmt.Println(fitToWidth(border, width))
+	fmt.Println(bottomBorder)
 	if strings.TrimSpace(status) == "" {
 		status = "ready"
 	}
