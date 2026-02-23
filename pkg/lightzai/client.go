@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -13,6 +12,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"syscall"
+	"unsafe"
 )
 
 type Config struct {
@@ -62,6 +64,44 @@ func loadSavedConfig() savedConfig {
 		return savedConfig{}
 	}
 	return cfg
+}
+
+func saveUserConfig(cfg savedConfig) error {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return fmt.Errorf("home directory를 찾을 수 없습니다")
+	}
+	dir := filepath.Join(home, ".config", "light-zai")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	p := filepath.Join(dir, "config.json")
+
+	merged := loadSavedConfig()
+	if cfg.APIKey != "" {
+		merged.APIKey = cfg.APIKey
+	}
+	if cfg.Model != "" {
+		merged.Model = cfg.Model
+	}
+	if cfg.BaseURL != "" {
+		merged.BaseURL = cfg.BaseURL
+	}
+	if cfg.APIPrefix != "" {
+		merged.APIPrefix = cfg.APIPrefix
+	}
+	if cfg.MaxTokens > 0 {
+		merged.MaxTokens = cfg.MaxTokens
+	}
+	if cfg.Temperature > 0 {
+		merged.Temperature = cfg.Temperature
+	}
+
+	b, err := json.MarshalIndent(merged, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(p, b, 0o600)
 }
 
 func envInt(name string, def int) int {
@@ -217,9 +257,6 @@ func DefaultConfigFromEnv() Config {
 }
 
 func NewClient(cfg Config) (*Client, error) {
-	if cfg.APIKey == "" {
-		return nil, errors.New("ZAI_API_KEY (or LZAI_API_KEY) is required")
-	}
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 45 * time.Second
 	}
@@ -256,6 +293,9 @@ type chatResponse struct {
 }
 
 func (c *Client) Chat(ctx context.Context, messages []Message) (string, error) {
+	if strings.TrimSpace(c.cfg.APIKey) == "" {
+		return "", fmt.Errorf("API 키가 비어 있습니다. /setup 명령으로 키를 먼저 설정하세요")
+	}
 	url := fmt.Sprintf("https://%s%s/chat/completions", c.cfg.BaseURL, c.cfg.APIPrefix)
 	payload := chatRequest{
 		Model:       c.cfg.Model,
@@ -287,10 +327,10 @@ func (c *Client) Chat(ctx context.Context, messages []Message) (string, error) {
 		return "", err
 	}
 	if out.Error != nil {
-		return "", errors.New(out.Error.Message)
+		return "", fmt.Errorf(out.Error.Message)
 	}
 	if len(out.Choices) == 0 {
-		return "", errors.New("empty response")
+		return "", fmt.Errorf("empty response")
 	}
 	return out.Choices[0].Message.Content, nil
 }
@@ -336,6 +376,91 @@ func pagePrint(text string, width, height int, in *bufio.Scanner) {
 	}
 }
 
+func detectTTYSize(defaultW, defaultH int) (int, int) {
+	if defaultW < 20 {
+		defaultW = 20
+	}
+	if defaultH < 8 {
+		defaultH = 8
+	}
+	ws := &struct {
+		Row    uint16
+		Col    uint16
+		Xpixel uint16
+		Ypixel uint16
+	}{}
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, os.Stdout.Fd(), uintptr(syscall.TIOCGWINSZ), uintptr(unsafe.Pointer(ws)))
+	if errno != 0 {
+		return defaultW, defaultH
+	}
+	w, h := int(ws.Col), int(ws.Row)
+	if w < 20 {
+		w = 20
+	}
+	if h < 8 {
+		h = 8
+	}
+	return w, h
+}
+
+func runSetupFlow(s *bufio.Scanner, c *Client) {
+	fmt.Println("[온보딩] Z.AI 설정을 시작합니다. Enter를 누르면 기본값을 사용합니다.")
+	fmt.Print("ZAI API Key 입력: ")
+	if !s.Scan() {
+		fmt.Println("온보딩이 취소되었습니다.")
+		return
+	}
+	key := strings.TrimSpace(s.Text())
+	if key == "" {
+		fmt.Println("API 키가 비어 있어 설정을 저장하지 않았습니다.")
+		return
+	}
+
+	fmt.Printf("모델 [%s]: ", c.cfg.Model)
+	if !s.Scan() {
+		return
+	}
+	model := strings.TrimSpace(s.Text())
+	if model == "" {
+		model = c.cfg.Model
+	}
+
+	fmt.Printf("Base URL [%s]: ", c.cfg.BaseURL)
+	if !s.Scan() {
+		return
+	}
+	baseURL := strings.TrimSpace(s.Text())
+	if baseURL == "" {
+		baseURL = c.cfg.BaseURL
+	}
+
+	fmt.Printf("API Prefix [%s]: ", c.cfg.APIPrefix)
+	if !s.Scan() {
+		return
+	}
+	apiPrefix := strings.TrimSpace(s.Text())
+	if apiPrefix == "" {
+		apiPrefix = c.cfg.APIPrefix
+	}
+
+	c.cfg.APIKey = key
+	c.cfg.Model = model
+	c.cfg.BaseURL = baseURL
+	c.cfg.APIPrefix = apiPrefix
+
+	err := saveUserConfig(savedConfig{
+		APIKey:    key,
+		Model:     model,
+		BaseURL:   baseURL,
+		APIPrefix: apiPrefix,
+	})
+	if err != nil {
+		fmt.Println("설정 저장 실패:", err)
+		return
+	}
+	fmt.Println("온보딩 완료: 설정이 ~/.config/light-zai/config.json 에 저장되었습니다.")
+}
+
 func trimHistory(history []Message, max int) []Message {
 	if len(history) <= max {
 		return history
@@ -346,9 +471,13 @@ func trimHistory(history []Message, max int) []Message {
 }
 
 func RunREPL(ctx context.Context, c *Client) error {
-	fmt.Println("Light-zai Go (ARMv7/저메모리) — 종료: /exit, 초기화: /clear")
+	fmt.Println("Light-zai Go (ARMv7/저메모리) — 종료: /exit, 초기화: /clear, 설정: /setup")
 	s := bufio.NewScanner(os.Stdin)
 	s.Buffer(make([]byte, 0, 4096), 1024*1024)
+	if strings.TrimSpace(c.cfg.APIKey) == "" {
+		fmt.Println("API 키가 없어 온보딩을 시작합니다. 필요 시 /setup 명령으로 다시 실행할 수 있습니다.")
+		runSetupFlow(s, c)
+	}
 	history := []Message{{Role: "system", Content: "당신은 간결하고 정확한 코딩 도우미입니다."}}
 	for {
 		fmt.Print("you> ")
@@ -365,6 +494,10 @@ func RunREPL(ctx context.Context, c *Client) error {
 		if text == "/clear" {
 			history = history[:1]
 			fmt.Println("대화 기록을 초기화했습니다.")
+			continue
+		}
+		if text == "/setup" {
+			runSetupFlow(s, c)
 			continue
 		}
 		history = append(history, Message{Role: "user", Content: text})
@@ -384,7 +517,8 @@ func RunREPL(ctx context.Context, c *Client) error {
 			continue
 		}
 		fmt.Println("ai>")
-		pagePrint(ans, c.cfg.ScreenWidth, c.cfg.ScreenHeight, s)
+		w, h := detectTTYSize(c.cfg.ScreenWidth, c.cfg.ScreenHeight)
+		pagePrint(ans, w, h, s)
 		history = append(history, Message{Role: "assistant", Content: ans})
 		history = trimHistory(history, c.cfg.MaxHistory)
 	}
