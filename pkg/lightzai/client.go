@@ -389,6 +389,12 @@ func wrapText(s string, width int) []string {
 
 func pagePrint(text string, width, height int, in *bufio.Scanner) {
 	lines := wrapText(text, width)
+	if !isTerminal(os.Stdin.Fd()) || !isTerminal(os.Stdout.Fd()) {
+		for _, line := range lines {
+			fmt.Println(line)
+		}
+		return
+	}
 	pageSize := height - 2
 	if pageSize < 3 {
 		pageSize = 3
@@ -407,6 +413,17 @@ func pagePrint(text string, width, height int, in *bufio.Scanner) {
 			}
 		}
 	}
+}
+
+func isTerminal(fd uintptr) bool {
+	ws := &struct {
+		Row    uint16
+		Col    uint16
+		Xpixel uint16
+		Ypixel uint16
+	}{}
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, uintptr(syscall.TIOCGWINSZ), uintptr(unsafe.Pointer(ws)))
+	return errno == 0
 }
 
 func detectTTYSize(defaultW, defaultH int) (int, int) {
