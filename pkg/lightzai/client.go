@@ -12,10 +12,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 	"unicode"
-
-	"syscall"
 	"unsafe"
 )
 
@@ -41,6 +40,8 @@ type Client struct {
 	cfg        Config
 	httpClient *http.Client
 }
+
+const defaultSystemPrompt = "당신은 간결하고 정확한 코딩 도우미입니다."
 
 type savedConfig struct {
 	APIKey      string  `json:"apiKey"`
@@ -277,6 +278,10 @@ func NewClient(cfg Config) (*Client, error) {
 	}, nil
 }
 
+func (c *Client) SystemPrompt() string {
+	return defaultSystemPrompt
+}
+
 type chatRequest struct {
 	Model       string    `json:"model"`
 	Messages    []Message `json:"messages"`
@@ -389,6 +394,12 @@ func wrapText(s string, width int) []string {
 
 func pagePrint(text string, width, height int, in *bufio.Scanner) {
 	lines := wrapText(text, width)
+	if !isTerminal(os.Stdin.Fd()) || !isTerminal(os.Stdout.Fd()) {
+		for _, line := range lines {
+			fmt.Println(line)
+		}
+		return
+	}
 	pageSize := height - 2
 	if pageSize < 3 {
 		pageSize = 3
@@ -407,6 +418,17 @@ func pagePrint(text string, width, height int, in *bufio.Scanner) {
 			}
 		}
 	}
+}
+
+func isTerminal(fd uintptr) bool {
+	ws := &struct {
+		Row    uint16
+		Col    uint16
+		Xpixel uint16
+		Ypixel uint16
+	}{}
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, uintptr(syscall.TIOCGWINSZ), uintptr(unsafe.Pointer(ws)))
+	return errno == 0
 }
 
 func detectTTYSize(defaultW, defaultH int) (int, int) {
@@ -503,7 +525,191 @@ func trimHistory(history []Message, max int) []Message {
 	return append([]Message{sys}, tail...)
 }
 
-func RunREPL(ctx context.Context, c *Client) error {
+func detectTermSize(defaultW, defaultH int) (int, int) {
+	w, h := detectTTYSize(defaultW, defaultH)
+	if !isTerminal(os.Stdout.Fd()) {
+		w = envInt("COLUMNS", defaultW)
+		h = envInt("LINES", defaultH)
+	}
+	if w < 20 {
+		w = 20
+	}
+	if h < 8 {
+		h = 8
+	}
+	return w, h
+}
+
+func displayWidth(s string) int {
+	w := 0
+	for _, r := range []rune(s) {
+		w += runeDisplayWidth(r)
+	}
+	return w
+}
+
+func fitToWidth(s string, width int) string {
+	if width < 1 {
+		return ""
+	}
+	var out []rune
+	lineW := 0
+	for _, r := range []rune(s) {
+		rw := runeDisplayWidth(r)
+		if lineW+rw > width {
+			break
+		}
+		out = append(out, r)
+		lineW += rw
+	}
+	if lineW < width {
+		return string(out) + strings.Repeat(" ", width-lineW)
+	}
+	return string(out)
+}
+
+func transcriptLines(transcript []Message, width int) []string {
+	var out []string
+	for _, m := range transcript {
+		role := strings.ToLower(strings.TrimSpace(m.Role))
+		prefix := role + ">"
+		switch role {
+		case "user":
+			prefix = "you>"
+		case "assistant":
+			prefix = "ai>"
+		case "system":
+			prefix = "sys>"
+		}
+		firstWidth := width - displayWidth(prefix) - 1
+		if firstWidth < 8 {
+			firstWidth = 8
+		}
+		raw := strings.TrimSpace(m.Content)
+		firstWrapped := wrapText(raw, firstWidth)
+		if len(firstWrapped) == 0 {
+			continue
+		}
+		out = append(out, prefix+" "+firstWrapped[0])
+		if len(firstWrapped) > 1 {
+			for _, ln := range firstWrapped[1:] {
+				out = append(out, "    "+ln)
+			}
+		}
+	}
+	return out
+}
+
+func renderTUI(c *Client, transcript []Message, status string, width, height int, showPrompt bool) {
+	fmt.Print("\033[2J\033[H")
+	if width < 24 {
+		width = 24
+	}
+	title := fmt.Sprintf("Light-zai Go TUI | model=%s | /help /clear /exit /setup", c.cfg.Model)
+	fmt.Println(fitToWidth(title, width))
+	innerWidth := width - 4
+	if innerWidth < 8 {
+		innerWidth = 8
+	}
+	topBorder := "┌" + strings.Repeat("─", width-2) + "┐"
+	bottomBorder := "└" + strings.Repeat("─", width-2) + "┘"
+	fmt.Println(topBorder)
+	lines := transcriptLines(transcript, innerWidth)
+	bodyHeight := height - 6
+	if bodyHeight < 3 {
+		bodyHeight = 3
+	}
+	if len(lines) > bodyHeight {
+		lines = lines[len(lines)-bodyHeight:]
+	}
+	for i := 0; i < bodyHeight; i++ {
+		if i < len(lines) {
+			fmt.Println("│ " + fitToWidth(lines[i], innerWidth) + " │")
+		} else {
+			fmt.Println("│ " + strings.Repeat(" ", innerWidth) + " │")
+		}
+	}
+	fmt.Println(bottomBorder)
+	if strings.TrimSpace(status) == "" {
+		status = "ready"
+	}
+	fmt.Println(fitToWidth("status: "+status, width))
+	fmt.Println(strings.Repeat(" ", width))
+	if showPrompt {
+		fmt.Printf("\033[%d;1H", height)
+		fmt.Print("you> ")
+	}
+}
+
+func runTUI(ctx context.Context, c *Client) error {
+	s := bufio.NewScanner(os.Stdin)
+	s.Buffer(make([]byte, 0, 4096), 1024*1024)
+	if strings.TrimSpace(c.cfg.APIKey) == "" {
+		fmt.Println("API 키가 없어 온보딩을 시작합니다. 필요 시 /setup 명령으로 다시 실행할 수 있습니다.")
+		runSetupFlow(s, c)
+	}
+	history := []Message{{Role: "system", Content: c.SystemPrompt()}}
+	var transcript []Message
+	status := "ready"
+	for {
+		w, h := detectTermSize(c.cfg.ScreenWidth, c.cfg.ScreenHeight)
+		renderTUI(c, transcript, status, w, h, true)
+		if !s.Scan() {
+			fmt.Println()
+			break
+		}
+		text := strings.TrimSpace(s.Text())
+		if text == "" {
+			continue
+		}
+		if text == "/exit" || text == "/quit" {
+			return nil
+		}
+		if text == "/clear" {
+			history = history[:1]
+			transcript = nil
+			status = "history cleared"
+			continue
+		}
+		if text == "/help" {
+			transcript = append(transcript, Message{Role: "system", Content: "명령: /help /clear /setup /exit"})
+			status = "help"
+			continue
+		}
+		if text == "/setup" {
+			runSetupFlow(s, c)
+			status = "setup updated"
+			continue
+		}
+
+		history = append(history, Message{Role: "user", Content: text})
+		history = trimHistory(history, c.cfg.MaxHistory)
+		transcript = append(transcript, Message{Role: "user", Content: text})
+		status = "waiting response..."
+		w, h = detectTermSize(c.cfg.ScreenWidth, c.cfg.ScreenHeight)
+		renderTUI(c, transcript, status, w, h, false)
+
+		ans, err := c.Chat(ctx, history)
+		if err != nil {
+			errMsg := err.Error()
+			lower := strings.ToLower(errMsg)
+			if strings.Contains(lower, "insufficient balance") || strings.Contains(lower, "no resource package") {
+				transcript = append(transcript, Message{Role: "system", Content: "크레딧/리소스 패키지가 부족합니다. 콘솔에서 충전 후 다시 시도하세요."})
+			} else {
+				transcript = append(transcript, Message{Role: "system", Content: "error> " + errMsg})
+			}
+			status = "request failed"
+			continue
+		}
+		transcript = append(transcript, Message{Role: "assistant", Content: ans})
+		history = append(history, Message{Role: "assistant", Content: ans})
+		history = trimHistory(history, c.cfg.MaxHistory)
+		status = "ready"
+	}
+	return s.Err()
+}
+
+func runLineREPL(ctx context.Context, c *Client) error {
 	fmt.Println("Light-zai Go (ARMv7/저메모리) — 종료: /exit, 초기화: /clear, 설정: /setup")
 	s := bufio.NewScanner(os.Stdin)
 	s.Buffer(make([]byte, 0, 4096), 1024*1024)
@@ -511,7 +717,7 @@ func RunREPL(ctx context.Context, c *Client) error {
 		fmt.Println("API 키가 없어 온보딩을 시작합니다. 필요 시 /setup 명령으로 다시 실행할 수 있습니다.")
 		runSetupFlow(s, c)
 	}
-	history := []Message{{Role: "system", Content: "당신은 간결하고 정확한 코딩 도우미입니다."}}
+	history := []Message{{Role: "system", Content: c.SystemPrompt()}}
 	for {
 		fmt.Print("you> ")
 		if !s.Scan() {
@@ -550,10 +756,24 @@ func RunREPL(ctx context.Context, c *Client) error {
 			continue
 		}
 		fmt.Println("ai>")
-		w, h := detectTTYSize(c.cfg.ScreenWidth, c.cfg.ScreenHeight)
+		w, h := detectTermSize(c.cfg.ScreenWidth, c.cfg.ScreenHeight)
 		pagePrint(ans, w, h, s)
 		history = append(history, Message{Role: "assistant", Content: ans})
 		history = trimHistory(history, c.cfg.MaxHistory)
 	}
 	return s.Err()
+}
+
+func RunREPL(ctx context.Context, c *Client) error {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("LZAI_UI")))
+	switch mode {
+	case "cli":
+		return runLineREPL(ctx, c)
+	case "tui":
+		return runTUI(ctx, c)
+	}
+	if isTerminal(os.Stdin.Fd()) && isTerminal(os.Stdout.Fd()) {
+		return runTUI(ctx, c)
+	}
+	return runLineREPL(ctx, c)
 }
