@@ -428,6 +428,20 @@ func runeLen(s string) int {
 	return len([]rune(s))
 }
 
+func fitToWidth(s string, width int) string {
+	if width < 1 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) > width {
+		r = r[:width]
+	}
+	if len(r) < width {
+		return string(r) + strings.Repeat(" ", width-len(r))
+	}
+	return string(r)
+}
+
 func transcriptLines(transcript []Message, width int) []string {
 	var out []string
 	for _, m := range transcript {
@@ -460,31 +474,37 @@ func transcriptLines(transcript []Message, width int) []string {
 	return out
 }
 
-func renderTUI(c *Client, transcript []Message, status string, width, height int) {
+func renderTUI(c *Client, transcript []Message, status string, width, height int, showPrompt bool) {
 	fmt.Print("\033[2J\033[H")
 	title := fmt.Sprintf("Light-zai Go TUI | model=%s | /help /clear /exit", c.cfg.Model)
-	if runeLen(title) > width {
-		title = string([]rune(title)[:width])
-	}
 	border := strings.Repeat("─", width)
-	fmt.Println(title)
-	fmt.Println(border)
+	fmt.Println(fitToWidth(title, width))
+	fmt.Println(fitToWidth(border, width))
 	lines := transcriptLines(transcript, width)
-	bodyHeight := height - 6
+	bodyHeight := height - 5
 	if bodyHeight < 5 {
 		bodyHeight = 5
 	}
 	if len(lines) > bodyHeight {
 		lines = lines[len(lines)-bodyHeight:]
 	}
-	for _, ln := range lines {
-		fmt.Println(ln)
+	for i := 0; i < bodyHeight; i++ {
+		if i < len(lines) {
+			fmt.Println(fitToWidth(lines[i], width))
+		} else {
+			fmt.Println(strings.Repeat(" ", width))
+		}
 	}
-	fmt.Println(border)
+	fmt.Println(fitToWidth(border, width))
 	if strings.TrimSpace(status) == "" {
 		status = "ready"
 	}
-	fmt.Println("status:", status)
+	fmt.Println(fitToWidth("status: "+status, width))
+	fmt.Println(strings.Repeat(" ", width))
+	if showPrompt {
+		fmt.Printf("\033[%d;1H", height)
+		fmt.Print("you> ")
+	}
 }
 
 func runTUI(ctx context.Context, c *Client) error {
@@ -495,8 +515,7 @@ func runTUI(ctx context.Context, c *Client) error {
 	status := "ready"
 	for {
 		w, h := detectTermSize(c.cfg.ScreenWidth, c.cfg.ScreenHeight)
-		renderTUI(c, transcript, status, w, h)
-		fmt.Print("you> ")
+		renderTUI(c, transcript, status, w, h, true)
 		if !s.Scan() {
 			fmt.Println()
 			break
@@ -525,7 +544,7 @@ func runTUI(ctx context.Context, c *Client) error {
 		transcript = append(transcript, Message{Role: "user", Content: text})
 		status = "waiting response..."
 		w, h = detectTermSize(c.cfg.ScreenWidth, c.cfg.ScreenHeight)
-		renderTUI(c, transcript, status, w, h)
+		renderTUI(c, transcript, status, w, h, false)
 
 		ans, err := c.Chat(ctx, history)
 		if err != nil {
